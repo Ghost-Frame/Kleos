@@ -691,6 +691,16 @@ fn is_patch_tool(tool_name: &str) -> bool {
 /// Summarize patch destinations without treating source text as a shell command.
 /// Unexpected framing or body syntax is denied rather than silently omitted.
 fn patch_command(input: &Value) -> Result<String, &'static str> {
+    if let Some(fields) = input.as_object() {
+        if ["input", "patch", "command"]
+            .iter()
+            .filter(|key| fields.contains_key(**key))
+            .count()
+            != 1
+        {
+            return Err("Patch input must contain exactly one patch field");
+        }
+    }
     let patch = input
         .as_str()
         .or_else(|| input.get("input").and_then(Value::as_str))
@@ -1587,6 +1597,9 @@ mod tests {
             );
         }
         assert!(derive_command("apply_patch", &json!({"command": "echo text"})).is_err());
+        let patch = "*** Begin Patch\n*** Add File: a.rs\n+x\n*** End Patch";
+        assert!(derive_command("apply_patch", &json!({"input": patch, "command": patch})).is_err());
+        assert!(derive_command("apply_patch", &json!({"input": null, "command": patch})).is_err());
     }
 
     /// Shell and unknown tools retain their full input even when it resembles a patch.
