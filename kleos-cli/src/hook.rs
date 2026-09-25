@@ -683,11 +683,79 @@ fn build_deny_output(event: &str, reason: &str) -> Value {
     })
 }
 
+/// Recognize only dedicated patch tools, never shell tools that mention patches.
+fn is_patch_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "apply_patch" | "functions.apply_patch")
+}
+
+/// Summarize patch destinations without treating source text as a shell command.
+/// Unexpected framing or body syntax is denied rather than silently omitted.
+fn patch_command(input: &Value) -> Result<String, &'static str> {
+    let patch = input
+        .as_str()
+        .or_else(|| input.get("input").and_then(Value::as_str))
+        .or_else(|| input.get("patch").and_then(Value::as_str))
+        .or_else(|| input.get("command").and_then(Value::as_str))
+        .ok_or("Patch input must contain a patch string")?;
+    let mut lines = patch.lines();
+    if lines.next() != Some("*** Begin Patch") {
+        return Err("Patch must start with its begin marker");
+    }
+    let mut paths = Vec::new();
+    let mut operation = "";
+    while let Some(line) = lines.next() {
+        if line == "*** End Patch" {
+            return if !paths.is_empty() && lines.next().is_none() {
+                Ok(paths.join("\n"))
+            } else {
+                Err("Patch must contain file operations and no trailing content")
+            };
+        }
+        let header = ["Update File", "Add File", "Delete File", "Move to"]
+            .iter()
+            .find_map(|kind| {
+                line.strip_prefix(&format!("*** {kind}: "))
+                    .map(|path| (*kind, path))
+            });
+        if let Some((kind, path)) = header {
+            if path.trim().is_empty() || path.chars().any(char::is_control) {
+                return Err("Patch file paths must be nonempty and contain no control characters");
+            }
+            if kind == "Move to" {
+                if operation != "Update File" {
+                    return Err("Patch move destination must follow an update");
+                }
+            } else {
+                operation = kind;
+            }
+            paths.push(format!("Edit {path}"));
+        } else {
+            let valid = match operation {
+                "Add File" => line.starts_with('+'),
+                "Update File" => {
+                    line.starts_with(['+', '-', ' '])
+                        || line == "@@"
+                        || line.starts_with("@@ ")
+                        || line == "*** End of File"
+                }
+                _ => false,
+            };
+            if !valid {
+                return Err("Patch contains an unexpected operation or body line");
+            }
+        }
+    }
+    Err("Patch must end with its end marker")
+}
+
 /// Derive the "command" string from Claude Code's tool_input JSON.
 /// For Bash: the literal command. For Write/Edit: "Write to <path>" or "Edit <path>".
 /// For others: serialized summary.
-fn derive_command(tool_name: &str, tool_input: &Value) -> String {
-    match tool_name {
+fn derive_command(tool_name: &str, tool_input: &Value) -> Result<String, &'static str> {
+    if is_patch_tool(tool_name) {
+        return patch_command(tool_input);
+    }
+    Ok(match tool_name {
         "Bash" => tool_input
             .get("command")
             .and_then(|c| c.as_str())
@@ -715,7 +783,7 @@ fn derive_command(tool_name: &str, tool_input: &Value) -> String {
             tool_name,
             serde_json::to_string(tool_input).unwrap_or_default()
         ),
-    }
+    })
 }
 
 // --- Hook handlers ---
@@ -969,59 +1037,88 @@ async fn handle_pre_tool(client: &Client, input: &Value) {
     let tool_input = input.get("tool_input").cloned().unwrap_or(json!({}));
     let session_id = extract_session_id(input);
 
-    let command = derive_command(tool_name, &tool_input);
+    let command = match derive_command(tool_name, &tool_input) {
+        Ok(command) => command,
+        Err(reason) => {
+            emit(&build_deny_output(
+                "PreToolUse",
+                &format!("Invalid file edit: {reason}. Submit a well-formed patch."),
+            ));
+            return;
+        }
+    };
+    // Dedicated patch tools use the existing edit approval policy, not an unknown-tool path.
+    let gate_tool_name = if is_patch_tool(tool_name) {
+        "Edit"
+    } else {
+        tool_name
+    };
 
     // Derive agent name from signer (matches PIV enrollment)
     let agent = client.agent_label();
 
-    let gate_body = json!({
-        "command": command,
-        "agent": agent,
-        "tool_name": tool_name,
-        "session_id": session_id,
-        "context": format!("tool_input: {}", serde_json::to_string(&tool_input).unwrap_or_default()),
-    });
-
-    let result = match request_gate_check(client, gate_body).await {
-        Ok(v) => v,
-        Err(e) => {
-            // The gate check did not produce a decision. By default this fails
-            // open (see module doc): the same hook bundle also drives context
-            // injection and activity reporting, so a Kleos fault must not
-            // hard-block every tool use. Operators who want any gate-check
-            // failure to deny instead set KLEOS_HOOK_GATE_FAIL_CLOSED=1.
-            if gate_fail_closed() {
-                emit(&build_deny_output(
-                    "PreToolUse",
-                    &format!(
-                        "kleos gate check failed and KLEOS_HOOK_GATE_FAIL_CLOSED is set: {}",
-                        describe_gate_failure(&e)
-                    ),
-                ));
-            } else {
-                eprintln!("kleos hook pre-tool: gate check failed ({}), allowing", e);
-            }
-            return;
-        }
+    // The server enforces Forge coverage for one path per request. Check every
+    // patch destination separately, preserving multiline shell commands intact.
+    let commands: Vec<&str> = if is_patch_tool(tool_name) {
+        command.lines().collect()
+    } else {
+        vec![command.as_str()]
     };
+    let mut enrichments = Vec::new();
+    for command in commands {
+        let gate_body = json!({
+            "command": command,
+            "agent": agent,
+            "tool_name": gate_tool_name,
+            "session_id": session_id,
+            "context": format!("tool_input: {}", serde_json::to_string(&tool_input).unwrap_or_default()),
+        });
 
-    // A reachable gate that omits or malforms `allowed` must not be treated as
-    // an implicit allow -- default to deny so a partial response cannot bypass
-    // the gate.
-    let allowed = result
-        .get("allowed")
-        .and_then(|a| a.as_bool())
-        .unwrap_or(false);
-    let reason = result
-        .get("reason")
-        .and_then(|r| r.as_str())
-        .unwrap_or("blocked by gate");
-    let enrichment = result.get("enrichment").and_then(|e| e.as_str());
+        let result = match request_gate_check(client, gate_body).await {
+            Ok(v) => v,
+            Err(e) => {
+                // The gate check did not produce a decision. By default this fails
+                // open (see module doc): the same hook bundle also drives context
+                // injection and activity reporting, so a Kleos fault must not
+                // hard-block every tool use. Operators who want any gate-check
+                // failure to deny instead set KLEOS_HOOK_GATE_FAIL_CLOSED=1.
+                if gate_fail_closed() {
+                    emit(&build_deny_output(
+                        "PreToolUse",
+                        &format!(
+                            "kleos gate check failed and KLEOS_HOOK_GATE_FAIL_CLOSED is set: {}",
+                            describe_gate_failure(&e)
+                        ),
+                    ));
+                } else {
+                    eprintln!("kleos hook pre-tool: gate check failed ({}), allowing", e);
+                }
+                return;
+            }
+        };
 
-    if !allowed {
-        emit(&build_deny_output("PreToolUse", reason));
-    } else if let Some(enrich) = enrichment {
-        emit(&build_context_output("PreToolUse", enrich));
+        // A reachable gate that omits or malforms `allowed` must not be treated as
+        // an implicit allow -- default to deny so a partial response cannot bypass
+        // the gate.
+        let allowed = result
+            .get("allowed")
+            .and_then(|a| a.as_bool())
+            .unwrap_or(false);
+        let reason = result
+            .get("reason")
+            .and_then(|r| r.as_str())
+            .unwrap_or("blocked by gate");
+        let enrichment = result.get("enrichment").and_then(|e| e.as_str());
+
+        if !allowed {
+            emit(&build_deny_output("PreToolUse", reason));
+            return;
+        } else if let Some(enrich) = enrichment {
+            enrichments.push(enrich.to_string());
+        }
+    }
+    if !enrichments.is_empty() {
+        emit(&build_context_output("PreToolUse", &enrichments.join("\n")));
     }
     // else: no output = implicit allow
 }
@@ -1423,28 +1520,95 @@ mod tests {
     /// Verifies Bash tool inputs use the literal command string.
     fn test_derive_command_bash() {
         let input = json!({"command": "ls -la"});
-        assert_eq!(derive_command("Bash", &input), "ls -la");
+        assert_eq!(derive_command("Bash", &input).unwrap(), "ls -la");
     }
 
     #[test]
     /// Verifies Write tool inputs summarize the destination path.
     fn test_derive_command_write() {
         let input = json!({"file_path": "/tmp/foo.rs"});
-        assert_eq!(derive_command("Write", &input), "Write /tmp/foo.rs");
+        assert_eq!(
+            derive_command("Write", &input).unwrap(),
+            "Write /tmp/foo.rs"
+        );
     }
 
     #[test]
     /// Verifies Edit tool inputs summarize the edited path.
     fn test_derive_command_edit() {
         let input = json!({"file_path": "/tmp/bar.rs"});
-        assert_eq!(derive_command("Edit", &input), "Edit /tmp/bar.rs");
+        assert_eq!(derive_command("Edit", &input).unwrap(), "Edit /tmp/bar.rs");
+    }
+
+    /// Patch bodies are source data, while every affected path remains visible to policy.
+    #[test]
+    fn test_derive_command_patch_paths() {
+        let patch = "*** Begin Patch\n*** Update File: src/a.rs\n@@\n-old\n+new\n*** Add File: src/b.rs\n+content\n*** End Patch";
+        assert_eq!(
+            derive_command("apply_patch", &json!(patch)).unwrap(),
+            "Edit src/a.rs\nEdit src/b.rs"
+        );
+        assert_eq!(
+            derive_command("functions.apply_patch", &json!({"input": patch})).unwrap(),
+            "Edit src/a.rs\nEdit src/b.rs"
+        );
+        assert_eq!(
+            derive_command("apply_patch", &json!({"command": patch})).unwrap(),
+            "Edit src/a.rs\nEdit src/b.rs"
+        );
+    }
+
+    /// Renames retain both destinations and deletes remain visible as mutations.
+    #[test]
+    fn test_derive_command_patch_move_and_delete() {
+        let patch = "*** Begin Patch\n*** Update File: old.rs\n*** Move to: new.rs\n@@\n-old\n+new\n*** Delete File: retired.rs\n*** End Patch\n";
+        assert_eq!(
+            derive_command("apply_patch", &json!({"patch": patch})).unwrap(),
+            "Edit old.rs\nEdit new.rs\nEdit retired.rs"
+        );
+    }
+
+    /// Incomplete, ambiguous, and mixed executable input cannot pass as file edits.
+    #[test]
+    fn test_derive_command_patch_rejects_malformed_input() {
+        for patch in [
+            "",
+            "*** Begin Patch\n*** End Patch",
+            "*** Begin Patch\n*** Add File: a.rs\n+x",
+            "*** Begin Patch\n*** Add File: a.rs\n+x\n*** End Patch\necho tail",
+            "*** Begin Patch\n*** Add File: \n+x\n*** End Patch",
+            "*** Begin Patch\n*** Move to: b.rs\n*** End Patch",
+            "*** Begin Patch\n*** Delete File: a.rs\necho body\n*** End Patch",
+            "*** Begin Patch\n*** Add File: a\tb.rs\n+x\n*** End Patch",
+        ] {
+            assert!(
+                derive_command("apply_patch", &json!(patch)).is_err(),
+                "{patch}"
+            );
+        }
+        assert!(derive_command("apply_patch", &json!({"command": "echo text"})).is_err());
+    }
+
+    /// Shell and unknown tools retain their full input even when it resembles a patch.
+    #[test]
+    fn test_derive_command_patch_does_not_reclassify_shell() {
+        let patch = "*** Begin Patch\n*** Add File: a.rs\n+x\n*** End Patch";
+        assert_eq!(
+            derive_command("Bash", &json!({"command": patch})).unwrap(),
+            patch
+        );
+        assert!(!is_patch_tool("Bash"));
+        assert!(!is_patch_tool("unknown_apply_patch"));
+        assert!(derive_command("unknown_apply_patch", &json!(patch))
+            .unwrap()
+            .contains("+x"));
     }
 
     #[test]
     /// Verifies WebFetch inputs derive a useful URL command summary.
     fn test_derive_command_other() {
         let input = json!({"url": "https://example.com"});
-        let cmd = derive_command("WebFetch", &input);
+        let cmd = derive_command("WebFetch", &input).unwrap();
         assert_eq!(cmd, "https://example.com");
     }
 
