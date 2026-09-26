@@ -1538,29 +1538,11 @@ async fn main() {
         },
 
         Commands::Doctor { json, dir } => {
-            let target = dir
+            let dir = dir
                 .as_ref()
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-            let inputs = doctor::LocalInputs {
-                version: env!("CARGO_PKG_VERSION"),
-                current_exe: std::env::current_exe().ok(),
-                path_env: std::env::var_os("PATH"),
-                server_url: cli.server.clone(),
-                repo_project: detect_project_at_path(&target),
-                env_project: std::env::var("SESSION_HANDOFF_PROJECT")
-                    .ok()
-                    .map(|v| v.trim().to_string())
-                    .filter(|v| !v.is_empty()),
-                home: std::env::var_os("HOME").map(std::path::PathBuf::from),
-                dir: target,
-            };
-            let mut report = doctor::Report {
-                checks: doctor::local_checks(&inputs),
-            };
-            report
-                .checks
-                .extend(doctor::server_checks(&client, env!("CARGO_PKG_VERSION")).await);
+            let report = doctor::run(&client, &cli.server, &dir).await;
             if *json {
                 println!("{}", serde_json::to_string_pretty(&report).unwrap());
             } else {

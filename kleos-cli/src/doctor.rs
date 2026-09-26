@@ -14,18 +14,19 @@ use std::time::Duration;
 /// Timeout applied to each server request made by doctor.
 const SERVER_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Outcome of one diagnostic check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// Outcome of one diagnostic check, declared in ascending severity so `max`
+/// picks the most severe of several results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
+    /// The check could not run because a prerequisite is absent.
+    Skip,
     /// The checked property holds.
     Ok,
     /// The property is degraded or suspicious but not broken.
     Warn,
     /// The property is broken and blocks normal use.
     Fail,
-    /// The check could not run because a prerequisite is absent.
-    Skip,
 }
 
 /// Presentation helpers for check statuses.
@@ -42,7 +43,7 @@ impl Status {
 }
 
 /// One diagnostic result with an optional human-applied fix.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Serialize)]
 pub struct Check {
     /// Stable machine-readable check identifier.
     pub id: &'static str,
@@ -74,7 +75,7 @@ impl Check {
 }
 
 /// Ordered collection of checks produced by one doctor run.
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Serialize)]
 pub struct Report {
     /// Checks in execution order.
     pub checks: Vec<Check>,
@@ -109,42 +110,31 @@ impl Report {
     }
 }
 
-/// Inputs gathered by the caller so local checks stay deterministic in tests.
-pub struct LocalInputs {
-    /// Version of the running CLI.
-    pub version: &'static str,
-    /// Path of the running executable, if resolvable.
-    pub current_exe: Option<PathBuf>,
-    /// Raw `PATH` value.
-    pub path_env: Option<std::ffi::OsString>,
-    /// Effective server URL.
-    pub server_url: String,
-    /// Project the repository at the target directory resolves to.
-    pub repo_project: Option<String>,
-    /// Non-empty `SESSION_HANDOFF_PROJECT` override, if set.
-    pub env_project: Option<String>,
-    /// Home directory used to locate agent client configuration.
-    pub home: Option<PathBuf>,
-    /// Directory doctor diagnoses, used for project-scope MCP config lookup.
-    pub dir: PathBuf,
-}
-
-/// Runs every local check in a fixed order.
-pub fn local_checks(inputs: &LocalInputs) -> Vec<Check> {
-    vec![
+/// Runs every check against the process environment and `server`, using
+/// `dir` for project resolution and project-scope MCP config lookup.
+pub async fn run(client: &Client, server_url: &str, dir: &Path) -> Report {
+    let version = env!("CARGO_PKG_VERSION");
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let env_project = std::env::var("SESSION_HANDOFF_PROJECT")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let mut checks = vec![
         check_binary(
-            inputs.version,
-            inputs.current_exe.as_deref(),
-            inputs.path_env.as_deref(),
+            version,
+            std::env::current_exe().ok().as_deref(),
+            std::env::var_os("PATH").as_deref(),
         ),
-        check_url(&inputs.server_url),
+        check_url(server_url),
         check_project(
-            inputs.repo_project.as_deref(),
-            inputs.env_project.as_deref(),
+            crate::detect_project_at_path(dir).as_deref(),
+            env_project.as_deref(),
         ),
-        check_mcp_registration(inputs.home.as_deref(), &inputs.dir),
-        check_hooks(inputs.home.as_deref()),
-    ]
+        check_mcp_registration(home.as_deref(), dir),
+        check_hooks(home.as_deref()),
+    ];
+    checks.extend(server_checks(client, version).await);
+    Report { checks }
 }
 
 /// Reports the CLI version and warns when `PATH` resolves `kleos-cli` to a
@@ -249,7 +239,7 @@ fn check_url(urls: &str) -> Check {
     let mut parts = Vec::new();
     for url in urls.split(',').map(str::trim).filter(|u| !u.is_empty()) {
         let (s, detail) = classify_url(url);
-        status = worse(status, s);
+        status = status.max(s);
         parts.push(detail);
     }
     if parts.is_empty() {
@@ -367,7 +357,7 @@ fn codex_mcp(home: &Path) -> ClientConfig {
                         servers.keys().any(|k| k.to_lowercase().contains("kleos"))
                     }),
             ),
-            Err(e) => ClientConfig::Unreadable(e.to_string()),
+            Err(e) => ClientConfig::Unreadable(format!("{}: {e}", path.display())),
         },
     }
 }
@@ -394,7 +384,7 @@ fn check_mcp_registration(home: Option<&Path>, dir: &Path) -> Check {
             ClientConfig::Parsed(false) => (format!("{name}: not registered"), Status::Warn),
         };
         parts.push(part);
-        status = worse(status, s);
+        status = status.max(s);
     }
     let check = Check::new("mcp_registration", status, parts.join(", "));
     if status == Status::Warn {
@@ -403,24 +393,6 @@ fn check_mcp_registration(home: Option<&Path>, dir: &Path) -> Check {
         )
     } else {
         check
-    }
-}
-
-/// Combines two statuses, keeping the more severe one. Skip is least severe.
-fn worse(a: Status, b: Status) -> Status {
-    /// Severity rank used for comparison.
-    fn rank(s: Status) -> u8 {
-        match s {
-            Status::Skip => 0,
-            Status::Ok => 1,
-            Status::Warn => 2,
-            Status::Fail => 3,
-        }
-    }
-    if rank(b) > rank(a) {
-        b
-    } else {
-        a
     }
 }
 
@@ -443,27 +415,29 @@ fn hook_commands(value: &Value, out: &mut Vec<String>) {
     }
 }
 
-/// Resolves the executable token of a hook command to a path when it is
-/// absolute or home-relative; bare names are left to the shell and ignored.
-fn hook_executable(command: &str, home: &Path) -> Option<PathBuf> {
-    let token = command.split_whitespace().find(|t| !t.contains('='))?;
-    let token = token.trim_matches(|c| c == '"' || c == '\'');
-    let home_str = home.to_string_lossy();
-    let expanded = if let Some(rest) = token.strip_prefix("~/") {
-        home.join(rest)
-    } else if let Some(rest) = token
-        .strip_prefix("$HOME/")
-        .or_else(|| token.strip_prefix("${HOME}/"))
-    {
-        home.join(rest)
-    } else {
-        PathBuf::from(token.replace("$HOME", &home_str))
-    };
-    expanded.is_absolute().then_some(expanded)
+/// Returns every absolute or home-relative path token in a hook command, so
+/// both `~/hook.sh` and `bash ~/hook.sh` are checked. Bare names are left to
+/// the shell's `PATH` lookup and ignored.
+fn hook_paths(command: &str, home: &Path) -> Vec<PathBuf> {
+    command
+        .split_whitespace()
+        .map(|t| t.trim_matches(|c| c == '"' || c == '\''))
+        .map(|t| t.split_once('=').map_or(t, |(_, value)| value))
+        .filter_map(|t| {
+            if let Some(rest) = ["~/", "$HOME/", "${HOME}/"]
+                .iter()
+                .find_map(|prefix| t.strip_prefix(prefix))
+            {
+                Some(home.join(rest))
+            } else {
+                t.starts_with('/').then(|| PathBuf::from(t))
+            }
+        })
+        .collect()
 }
 
-/// Lists Claude Code hooks that mention kleos and warns when a referenced
-/// executable path does not exist.
+/// Lists Claude Code hooks that mention kleos and warns when a path they
+/// reference does not exist.
 fn check_hooks(home: Option<&Path>) -> Check {
     let Some(home) = home else {
         return Check::new("hooks", Status::Skip, "home directory unknown");
@@ -494,7 +468,7 @@ fn check_hooks(home: Option<&Path>) -> Check {
         .collect();
     let missing: Vec<String> = kleos
         .iter()
-        .filter_map(|c| hook_executable(c, home))
+        .flat_map(|c| hook_paths(c, home))
         .filter(|p| !p.exists())
         .map(|p| p.display().to_string())
         .collect();
@@ -503,7 +477,7 @@ fn check_hooks(home: Option<&Path>) -> Check {
             "hooks",
             Status::Warn,
             format!(
-                "{} kleos hook(s); missing executable(s): {}",
+                "{} kleos hook(s); missing path(s): {}",
                 kleos.len(),
                 missing.join(", ")
             ),
@@ -520,7 +494,10 @@ fn check_hooks(home: Option<&Path>) -> Check {
         Check::new(
             "hooks",
             Status::Ok,
-            format!("{} kleos hook(s), all executables present", kleos.len()),
+            format!(
+                "{} kleos hook(s), all referenced paths present",
+                kleos.len()
+            ),
         )
     }
 }
@@ -579,7 +556,7 @@ fn classify_auth_error(err: &str) -> Check {
 
 /// Runs read-only server checks. Dependent checks are skipped when the
 /// server is unreachable.
-pub async fn server_checks(client: &Client, cli_version: &str) -> Vec<Check> {
+async fn server_checks(client: &Client, cli_version: &str) -> Vec<Check> {
     let url = client.base_url().to_string();
     let health = match client.get_with_timeout("/health", SERVER_TIMEOUT).await {
         Ok(v) => v,
@@ -715,7 +692,8 @@ mod tests {
     /// MCP registration is found in nested Claude JSON and Codex TOML without leaking values.
     #[test]
     fn mcp_detection_in_nested_json_and_toml() {
-        let dir = tempdir();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         assert_eq!(
             check_mcp_registration(Some(&dir), &dir).status,
             Status::Skip
@@ -741,7 +719,8 @@ mod tests {
     /// A `.mcp.json` in an ancestor directory counts as Claude Code registration.
     #[test]
     fn mcp_detection_via_ancestor_project_file() {
-        let home = tempdir();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
         let repo = home.join("projects").join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::write(
@@ -762,10 +741,11 @@ mod tests {
             .contains("claude-code: registered"));
     }
 
-    /// Hooks referencing missing absolute executables are reported.
+    /// Missing paths are reported whether a hook runs them directly or through an interpreter.
     #[test]
     fn hooks_flag_missing_executables() {
-        let dir = tempdir();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         std::fs::create_dir_all(dir.join(".claude/hooks")).unwrap();
         std::fs::write(dir.join(".claude/hooks/present.sh"), "").unwrap();
         let settings = json!({"hooks": {"SessionStart": [{"hooks": [
@@ -777,6 +757,10 @@ mod tests {
         let check = check_hooks(Some(&dir));
         assert_eq!(check.status, Status::Warn, "{}", check.detail);
         assert!(check.detail.contains("gone-kleos.sh"));
+        assert!(
+            check.detail.contains("kleos-start.sh"),
+            "interpreter-launched script must be checked"
+        );
         assert!(!check.detail.contains("present.sh"));
     }
 
@@ -806,7 +790,8 @@ mod tests {
     /// A different kleos-cli earlier on PATH is reported as stale.
     #[test]
     fn binary_detects_stale_path_entry() {
-        let dir = tempdir();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let bin_a = dir.join("a");
         let bin_b = dir.join("b");
         std::fs::create_dir_all(&bin_a).unwrap();
@@ -824,19 +809,5 @@ mod tests {
             check_binary("1.0.0", Some(&exe), Some(&path)).status,
             Status::Ok
         );
-    }
-
-    /// Creates a unique empty directory under the system temp dir.
-    fn tempdir() -> PathBuf {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        /// Per-process counter that keeps test directories distinct.
-        static N: AtomicU32 = AtomicU32::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "kleos-doctor-test-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::SeqCst)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
     }
 }
