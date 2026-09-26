@@ -1,3 +1,4 @@
+mod doctor;
 mod hook;
 mod import_plugins;
 use hook::{run_hook, HookCommands};
@@ -139,6 +140,15 @@ enum Commands {
     },
     /// Check server health
     Health,
+    /// Diagnose client installation, configuration, and server access (read-only)
+    Doctor {
+        /// Emit the report as JSON
+        #[arg(long)]
+        json: bool,
+        /// Directory used for project resolution (defaults to the current directory)
+        #[arg(long)]
+        dir: Option<String>,
+    },
     /// Report an activity event (fans out to Chiasm/Axon/Broca/Thymus/Skills/Memory)
     Activity {
         /// Action (e.g. task.started, task.progress, task.completed, task.blocked, error.raised)
@@ -1526,6 +1536,38 @@ async fn main() {
             Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap()),
             Err(e) => eprintln!("Error: {}", e),
         },
+
+        Commands::Doctor { json, dir } => {
+            let target = dir
+                .as_ref()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            let inputs = doctor::LocalInputs {
+                version: env!("CARGO_PKG_VERSION"),
+                current_exe: std::env::current_exe().ok(),
+                path_env: std::env::var_os("PATH"),
+                server_url: cli.server.clone(),
+                repo_project: detect_project_at_path(&target),
+                env_project: std::env::var("SESSION_HANDOFF_PROJECT")
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty()),
+                home: std::env::var_os("HOME").map(std::path::PathBuf::from),
+                dir: target,
+            };
+            let mut report = doctor::Report {
+                checks: doctor::local_checks(&inputs),
+            };
+            report
+                .checks
+                .extend(doctor::server_checks(&client, env!("CARGO_PKG_VERSION")).await);
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&report).unwrap());
+            } else {
+                print!("{}", report.render_text());
+            }
+            std::process::exit(report.exit_code());
+        }
 
         Commands::Activity {
             action,
