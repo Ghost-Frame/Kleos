@@ -108,7 +108,7 @@ pub async fn resolve_from_kleos_with_policy(
     // target_prefix below is built from these and matched with starts_with, so
     // a `/` in category or ` = ` in name could shadow or skip a different entry
     // (read-path sibling of the CREDD-1 write-path injection).
-    if !kleos_sync::is_safe_ident(category) || !kleos_sync::is_safe_ident(name) {
+    if !kleos_sync::is_safe_v3_category(category) || !kleos_sync::is_safe_v3_name(name) {
         return Err(
             CredError::InvalidInput(format!("unsafe characters in {}/{}", category, name)).into(),
         );
@@ -210,7 +210,11 @@ pub async fn resolve_from_kleos_with_policy(
         CredError::InvalidInput(format!("kleos response parse error: {}", e))
     })?;
 
-    let target_prefix = format!("[CRED:v3] {}/{} = ", category, name);
+    let target_prefix = format!(
+        "[CRED:v3] {}/{} = ",
+        kleos_sync::encode_v3_category(category),
+        name
+    );
     let entry = list
         .results
         .iter()
