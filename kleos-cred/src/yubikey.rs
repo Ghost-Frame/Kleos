@@ -141,8 +141,10 @@ pub fn challenge_response(challenge: &[u8]) -> Result<[u8; RESPONSE_SIZE]> {
         )));
     }
 
-    let mut response = [0u8; RESPONSE_SIZE];
-    response.copy_from_slice(&decoded);
+    let response: [u8; RESPONSE_SIZE] = decoded
+        .as_slice()
+        .try_into()
+        .map_err(|_| CredError::YubiKey("unexpected HMAC response length".into()))?;
     record_success();
     debug!("YubiKey challenge-response ok ({} bytes)", RESPONSE_SIZE);
     Ok(response)

@@ -1073,23 +1073,10 @@ fn cmd_rekey_challenge(auth_mode: &str, new_challenge_path: &Path, dry_run: bool
     let old_key = Zeroizing::new(derive_key_legacy(&old_response[..]));
     #[allow(deprecated)]
     let new_key = Zeroizing::new(derive_key_legacy(&new_response[..]));
-    let to_array = |k: Zeroizing<[u8; KEY_SIZE]>| {
-        let mut out = Zeroizing::new([0u8; KEY_SIZE]);
-        out.copy_from_slice(&k[..]);
-        out
-    };
     let (old_at_rest, new_at_rest) = if at_rest_yubikey {
         (
-            Some(to_array(kleos_cred::crypto::derive_key(
-                0,
-                b"",
-                Some(&old_response[..]),
-            ))),
-            Some(to_array(kleos_cred::crypto::derive_key(
-                0,
-                b"",
-                Some(&new_response[..]),
-            ))),
+            Some(at_rest_key_from_response(&old_response[..])?),
+            Some(at_rest_key_from_response(&new_response[..])?),
         )
     } else {
         (None, None)
@@ -1147,6 +1134,18 @@ fn cmd_rekey_challenge(auth_mode: &str, new_challenge_path: &Path, dry_run: bool
     Ok(())
 }
 
+/// Derive the YubiKey-mode SQLCipher at-rest key from a slot-2 response.
+///
+/// Delegates to `encryption::resolve_at_rest_key` so the derivation has a
+/// single source of truth shared with the normal open path.
+fn at_rest_key_from_response(response: &[u8]) -> Result<Zeroizing<[u8; KEY_SIZE]>> {
+    let mut config = kleos_lib::config::Config::from_env();
+    config.encryption.mode = kleos_lib::config::EncryptionMode::Yubikey;
+    let key = kleos_cred::encryption::resolve_at_rest_key(&config, Some(response))?
+        .context("yubikey at-rest mode produced no key")?;
+    Ok(Zeroizing::new(key))
+}
+
 /// This host's vault keys: (secret master key, optional SQLCipher at-rest key).
 type VaultKeys = (Zeroizing<[u8; KEY_SIZE]>, Option<Zeroizing<[u8; KEY_SIZE]>>);
 
@@ -1164,12 +1163,11 @@ fn local_vault_keys() -> Result<VaultKeys> {
                 .map(|m| format!("{m:?}").eq_ignore_ascii_case("yubikey"))
                 .unwrap_or(false)
         });
-    let at_rest = at_rest_yubikey.then(|| {
-        let derived = kleos_cred::crypto::derive_key(0, b"", Some(&response[..]));
-        let mut key = Zeroizing::new([0u8; KEY_SIZE]);
-        key.copy_from_slice(&derived[..]);
-        key
-    });
+    let at_rest = if at_rest_yubikey {
+        Some(at_rest_key_from_response(&response[..])?)
+    } else {
+        None
+    };
     Ok((master, at_rest))
 }
 

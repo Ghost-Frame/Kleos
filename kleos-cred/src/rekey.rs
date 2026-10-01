@@ -14,8 +14,6 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
-use rand::rngs::OsRng;
-use rand::TryRngCore;
 use rusqlite::{params, Connection, TransactionBehavior};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
@@ -76,17 +74,16 @@ fn open_row(key: &[u8; KEY_SIZE], ciphertext: &[u8], nonce: &[u8]) -> Result<Zer
 }
 
 /// Encrypt plaintext bytes for one row under a fresh random nonce.
+///
+/// Uses the crate's `crypto::encrypt` (nonce || ciphertext) and splits the
+/// result into the separate nonce and ciphertext columns the vault stores.
 fn seal_row(key: &[u8; KEY_SIZE], plaintext: &[u8]) -> Result<(Vec<u8>, [u8; NONCE_SIZE])> {
-    let cipher = Aes256Gcm::new_from_slice(key)
-        .map_err(|e| CredError::Encryption(format!("invalid key: {e}")))?;
-    let mut nonce = [0u8; NONCE_SIZE];
-    OsRng
-        .try_fill_bytes(&mut nonce)
-        .map_err(|e| CredError::Encryption(format!("CSPRNG unavailable: {e}")))?;
-    let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce), plaintext)
-        .map_err(|e| CredError::Encryption(format!("encryption failed: {e}")))?;
-    Ok((ciphertext, nonce))
+    let blob = encrypt(key, plaintext)?;
+    let nonce: [u8; NONCE_SIZE] = blob
+        .get(..NONCE_SIZE)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| CredError::Encryption("encrypt returned a short blob".into()))?;
+    Ok((blob[NONCE_SIZE..].to_vec(), nonce))
 }
 
 /// Map a rusqlite error into the crate error type.
@@ -355,9 +352,11 @@ pub fn unwrap_master_key(passphrase: &str, blob: &[u8]) -> Result<Zeroizing<[u8;
             "recovery kit holds a key of the wrong size".into(),
         ));
     }
-    let mut key = Zeroizing::new([0u8; KEY_SIZE]);
-    key.copy_from_slice(&plaintext);
-    Ok(key)
+    let key: [u8; KEY_SIZE] = plaintext
+        .as_slice()
+        .try_into()
+        .map_err(|_| CredError::Decryption("recovery kit holds a key of the wrong size".into()))?;
+    Ok(Zeroizing::new(key))
 }
 
 /// Return whether two master keys are equal, in constant time.
@@ -939,7 +938,9 @@ pub fn v3_opens_with(key: &[u8; KEY_SIZE], blob: &[u8]) -> bool {
 mod tests {
     use super::*;
     use crate::crypto::encrypt_secret;
+    use crate::crypto::generate_random_key;
     use crate::types::SecretData;
+    use std::sync::LazyLock;
 
     /// Build a fixture database containing `count` secrets encrypted under `key`.
     fn fixture(dir: &Path, key: &[u8; KEY_SIZE], count: usize) -> PathBuf {
@@ -967,9 +968,15 @@ mod tests {
     }
 
     /// Distinct deterministic test keys.
-    const OLD: [u8; KEY_SIZE] = [7u8; KEY_SIZE];
+    static OLD: LazyLock<[u8; KEY_SIZE]> = LazyLock::new(generate_random_key);
     /// Rotation target key.
-    const NEW: [u8; KEY_SIZE] = [9u8; KEY_SIZE];
+    static NEW: LazyLock<[u8; KEY_SIZE]> = LazyLock::new(generate_random_key);
+    /// Key that belongs to neither side of a rotation.
+    static FOREIGN: LazyLock<[u8; KEY_SIZE]> = LazyLock::new(generate_random_key);
+    /// Original SQLCipher at-rest key in the whole-file test.
+    static AT_REST_OLD: LazyLock<[u8; KEY_SIZE]> = LazyLock::new(generate_random_key);
+    /// Target SQLCipher at-rest key in the whole-file test.
+    static AT_REST_NEW: LazyLock<[u8; KEY_SIZE]> = LazyLock::new(generate_random_key);
 
     /// Every row moves to the new key and none remain readable with the old key.
     #[test]
@@ -1008,7 +1015,7 @@ mod tests {
         let db = fixture(dir.path(), &OLD, 3);
         let conn = Connection::open(&db).unwrap();
         let (ciphertext, nonce) = encrypt_secret(
-            &[1u8; KEY_SIZE],
+            &FOREIGN,
             &SecretData::Note {
                 content: "x".into(),
             },
@@ -1126,12 +1133,12 @@ mod tests {
             conn.execute_batch(&format!(
                 "ATTACH DATABASE '{}' AS enc KEY {}; SELECT sqlcipher_export('enc'); DETACH DATABASE enc;",
                 encrypted.display(),
-                sqlcipher_key_clause(Some(&[3u8; KEY_SIZE])).as_str()
+                sqlcipher_key_clause(Some(&AT_REST_OLD)).as_str()
             ))
             .unwrap();
         }
-        let old_at_rest = [3u8; KEY_SIZE];
-        let new_at_rest = [4u8; KEY_SIZE];
+        let old_at_rest = *AT_REST_OLD;
+        let new_at_rest = *AT_REST_NEW;
         assert!(
             open_vault(&encrypted, None).is_err(),
             "encrypted vault must not open without a key"
@@ -1264,7 +1271,7 @@ mod tests {
                 id: None,
                 category: "x".into(),
                 name: "locked".into(),
-                blob: encrypt(&[5u8; KEY_SIZE], &record).unwrap(),
+                blob: encrypt(&FOREIGN, &record).unwrap(),
             },
         ];
         let report = import_v3_entries(&db, None, &NEW, &entries, &OLD, false).unwrap();
