@@ -188,8 +188,10 @@ pub fn challenge_response_slot(challenge: &[u8], slot: u8) -> Result<[u8; RESPON
         )));
     }
 
-    let mut response = [0u8; RESPONSE_SIZE];
-    response.copy_from_slice(&decoded);
+    let response: [u8; RESPONSE_SIZE] = decoded
+        .as_slice()
+        .try_into()
+        .map_err(|_| CredError::YubiKey("unexpected HMAC response length".into()))?;
     record_success();
     debug!(
         slot,
