@@ -329,6 +329,15 @@ pub fn software_hmac(secret: &[u8], challenge: &[u8; CHALLENGE_SIZE]) -> [u8; RE
     response
 }
 
+/// Path of the challenge file this host currently uses, without creating one.
+///
+/// Returns `None` when no challenge file exists, so callers that must not
+/// silently fork the vault key (rotation, auditing) can refuse instead.
+pub fn active_challenge_path() -> Option<PathBuf> {
+    let path = config_dir().join(CHALLENGE_FILE);
+    path.exists().then_some(path)
+}
+
 /// Config directory for engram: `$XDG_CONFIG_HOME/engram` or
 /// `~/.config/engram`.
 fn config_dir() -> PathBuf {

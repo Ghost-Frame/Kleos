@@ -61,6 +61,10 @@ enum Commands {
         /// Source identifier
         #[arg(short, long)]
         source: Option<String>,
+        /// Store as a static memory, exempt from decay and consolidation
+        /// (required for CRED:v3 central-vault entries).
+        #[arg(long)]
+        is_static: bool,
     },
     /// Search memories
     Search {
@@ -96,6 +100,12 @@ enum Commands {
         /// Offset
         #[arg(short, long, default_value = "0")]
         offset: usize,
+        /// Only list memories in this category (e.g. `credential`).
+        #[arg(long)]
+        category: Option<String>,
+        /// Print the raw JSON response instead of a summary (for piping).
+        #[arg(long)]
+        json: bool,
     },
     /// Delete a memory
     Delete {
@@ -1286,6 +1296,7 @@ async fn main() {
             importance,
             tags,
             source,
+            is_static,
         } => {
             let tags_list: Vec<String> = tags
                 .as_deref()
@@ -1302,6 +1313,9 @@ async fn main() {
 
             if let Some(imp) = importance {
                 body["importance"] = json!(imp);
+            }
+            if *is_static {
+                body["is_static"] = json!(true);
             }
             if !tags_list.is_empty() {
                 body["tags"] = json!(tags_list);
@@ -1468,11 +1482,27 @@ async fn main() {
             }
         }
 
-        Commands::List { limit, offset } => {
-            match client
-                .get(&format!("/list?limit={}&offset={}", limit, offset))
-                .await
-            {
+        Commands::List {
+            limit,
+            offset,
+            category,
+            json,
+        } => {
+            let mut path = format!("/list?limit={}&offset={}", limit, offset);
+            if let Some(category) = category {
+                // Categories are simple identifiers; refuse anything that would need escaping.
+                if !category
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                {
+                    eprintln!("Error: category must be alphanumeric, '_' or '-'");
+                    std::process::exit(2);
+                }
+                path.push_str("&category=");
+                path.push_str(category);
+            }
+            match client.get(&path).await {
+                Ok(v) if *json => println!("{}", v),
                 Ok(v) => {
                     let items = v.as_array().cloned().unwrap_or_else(|| {
                         v.get("results")
