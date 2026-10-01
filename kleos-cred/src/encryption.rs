@@ -44,8 +44,7 @@ pub fn resolve_at_rest_key(
                 }
             };
             // Copy out of the Zeroizing wrapper into the fixed array the DB layer expects.
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&derived[..]);
+            let key: [u8; 32] = *derived;
             Ok(Some(key))
         }
         // Keyfile / Env: defer to the shared kleos_lib resolver (no YubiKey).
