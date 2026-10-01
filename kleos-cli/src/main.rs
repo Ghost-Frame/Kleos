@@ -112,6 +112,14 @@ enum Commands {
         /// Memory ID
         id: String,
     },
+    /// Forget a memory: hide it from listing and search without deleting it
+    Forget {
+        /// Memory ID
+        id: String,
+        /// Why the memory is being forgotten (recorded on the memory)
+        #[arg(long)]
+        reason: Option<String>,
+    },
     /// Bootstrap the database schema
     Bootstrap {
         /// Database path
@@ -1526,6 +1534,20 @@ async fn main() {
 
         Commands::Delete { id } => match client.delete(&format!("/memory/{}", id)).await {
             Ok(_) => println!("Deleted memory #{}", id),
+            Err(e) => eprintln!("Error: {}", e),
+        },
+
+        Commands::Forget { id, reason } => match client
+            .post(
+                &format!("/memory/{}/forget", id),
+                match reason {
+                    Some(reason) => json!({ "reason": reason }),
+                    None => json!({}),
+                },
+            )
+            .await
+        {
+            Ok(_) => println!("Forgot memory #{}", id),
             Err(e) => eprintln!("Error: {}", e),
         },
 

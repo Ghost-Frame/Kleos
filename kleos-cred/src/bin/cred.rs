@@ -1298,10 +1298,51 @@ fn cmd_v3_audit(
             .find(|(_, key)| v3_opens_with(key, &entry.blob))
             .map(|(label, _)| label.clone())
             .unwrap_or_else(|| "NO KEY TESTED".to_string());
-        groups
-            .entry(label)
-            .or_default()
-            .push(format!("{}/{}", entry.category, entry.name));
+        groups.entry(label).or_default().push(match entry.id {
+            Some(id) => format!("{}/{} #{id}", entry.category, entry.name),
+            None => format!("{}/{}", entry.category, entry.name),
+        });
+    }
+    // Value check: for every entry an extra key opens, compare its plaintext with
+    // the entry the current key opens for the same name (fingerprints only).
+    if keys.len() > 1 {
+        let current = &keys[0].1;
+        let mut current_values: BTreeMap<(String, String), Vec<u8>> = BTreeMap::new();
+        for entry in &entries {
+            if let Ok(plain) = kleos_cred::crypto::decrypt(current, &entry.blob) {
+                current_values.insert(
+                    (entry.category.clone(), entry.name.clone()),
+                    Sha256::digest(&plain).to_vec(),
+                );
+            }
+        }
+        let (mut same, mut differ, mut no_current) = (0usize, Vec::new(), Vec::new());
+        for entry in &entries {
+            for (label, key) in keys.iter().skip(1) {
+                if let Ok(plain) = kleos_cred::crypto::decrypt(key, &entry.blob) {
+                    let tag = format!(
+                        "{}/{} #{} ({label})",
+                        entry.category,
+                        entry.name,
+                        entry.id.unwrap_or(0)
+                    );
+                    match current_values.get(&(entry.category.clone(), entry.name.clone())) {
+                        Some(digest) if *digest == Sha256::digest(&plain).to_vec() => same += 1,
+                        Some(_) => differ.push(tag),
+                        None => no_current.push(tag),
+                    }
+                    break;
+                }
+            }
+        }
+        eprintln!(
+            "value check vs current key: identical {same}, DIFFERENT {}, no current-key copy {}",
+            differ.len(),
+            no_current.len()
+        );
+        for tag in differ.iter().chain(no_current.iter()) {
+            eprintln!("    check: {tag}");
+        }
     }
     let unique: std::collections::BTreeSet<_> =
         entries.iter().map(|e| (&e.category, &e.name)).collect();
