@@ -16,6 +16,7 @@ pub mod encryption;
 pub mod net;
 pub mod piv;
 pub mod recovery;
+pub mod rekey;
 pub mod storage;
 pub mod types;
 pub mod yubikey;
@@ -33,6 +34,7 @@ pub use types::{SecretData, SecretType};
 
 use thiserror::Error;
 
+/// Errors returned by credential storage, crypto, and YubiKey operations.
 #[derive(Debug, Error)]
 pub enum CredError {
     #[error("secret not found: {0}")]
@@ -63,9 +65,12 @@ pub enum CredError {
     KeyRevoked(String),
 }
 
+/// Crate-wide result alias using [`CredError`].
 pub type Result<T> = std::result::Result<T, CredError>;
 
+/// Map SQLite errors into the database error variant.
 impl From<rusqlite::Error> for CredError {
+    /// Wrap the SQLite error message.
     fn from(e: rusqlite::Error) -> Self {
         CredError::Database(e.to_string())
     }

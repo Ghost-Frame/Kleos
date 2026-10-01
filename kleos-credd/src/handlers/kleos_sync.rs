@@ -112,7 +112,7 @@ pub(crate) async fn fetch_v3_entries(state: &AppState) -> Result<Vec<KleosV3Entr
                 if let Some((cat, name)) = path.split_once('/') {
                     entries.push(KleosV3Entry {
                         id: row.id,
-                        category: cat.to_string(),
+                        category: decode_v3_category(cat),
                         name: name.to_string(),
                         hex_data: hex_data.trim().to_string(),
                     });
@@ -139,6 +139,39 @@ pub(crate) async fn store_to_kleos(
     }
 }
 
+/// True iff `s` is a safe v3 secret NAME: the `is_safe_ident` alphabet plus
+/// inner `/` separators (no leading, trailing, or doubled `/`). A slash in the
+/// name cannot shadow another entry because the category may not contain one
+/// and entries are matched on the full `{category}/{name} = ` prefix, which
+/// ends in ` = `; only the category must stay slash-free.
+pub(crate) fn is_safe_v3_name(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('/')
+        && !s.ends_with('/')
+        && !s.contains("//")
+        && s.split('/').all(is_safe_ident)
+}
+
+/// True iff `s` is a safe v3 CATEGORY: `/`-separated segments that each pass
+/// `is_safe_ident` (e.g. `cloudflare/zone`). Its slashes are escaped as `%2F`
+/// on the wire by `encode_v3_category`, so the stored category never contains
+/// `/` and cannot collide with a name. `%` is not in the segment alphabet, so
+/// decoding is unambiguous.
+pub(crate) fn is_safe_v3_category(s: &str) -> bool {
+    is_safe_v3_name(s)
+}
+
+/// Escape a category for the v3 content format (`/` becomes `%2F`).
+pub(crate) fn encode_v3_category(category: &str) -> String {
+    category.replace('/', "%2F")
+}
+
+/// Reverse `encode_v3_category`. Entries written before escaping existed never
+/// contain `%`, so they decode to themselves.
+pub(crate) fn decode_v3_category(stored: &str) -> String {
+    stored.replace("%2F", "/")
+}
+
 /// True iff `s` is non-empty and contains only alphanumerics, `-`, `_`, or `.`.
 /// Guards the V3 content format `[CRED:v3] {category}/{name} = {hex}`: a `/` in
 /// category or ` = ` in name would otherwise parse as a different entry on
@@ -157,10 +190,10 @@ async fn store_to_kleos_inner(
     master_key: &[u8; KEY_SIZE],
 ) -> Result<(), String> {
     // Reject category/name that would corrupt the V3 content format on re-parse.
-    if !is_safe_ident(category) {
+    if !is_safe_v3_category(category) {
         return Err(format!("category contains unsafe characters: {category:?}"));
     }
-    if !is_safe_ident(name) {
+    if !is_safe_v3_name(name) {
         return Err(format!("name contains unsafe characters: {name:?}"));
     }
 
@@ -170,7 +203,13 @@ async fn store_to_kleos_inner(
     let plaintext = serde_json::to_vec(data).map_err(|e| format!("serialize: {}", e))?;
     let ciphertext = encrypt(master_key, &plaintext).map_err(|e| format!("encrypt: {}", e))?;
     let hex_data = hex::encode(&ciphertext);
-    let content = format!("{}{}/{} = {}", V3_PREFIX, category, name, hex_data);
+    let content = format!(
+        "{}{}/{} = {}",
+        V3_PREFIX,
+        encode_v3_category(category),
+        name,
+        hex_data
+    );
 
     let base = kleos_url()?;
     let url = format!("{}/store", base.trim_end_matches('/'));
@@ -260,4 +299,66 @@ pub(crate) fn decrypt_v3_entry(
     let ciphertext = hex::decode(hex_data).map_err(|e| format!("hex decode: {}", e))?;
     let plaintext = decrypt(master_key, &ciphertext).map_err(|e| format!("decrypt: {}", e))?;
     serde_json::from_slice(&plaintext).map_err(|e| format!("json parse: {}", e))
+}
+
+/// Tests for the v3 identifier rules that guard the content format.
+#[cfg(test)]
+mod tests {
+    use super::{
+        decode_v3_category, encode_v3_category, is_safe_ident, is_safe_v3_category, is_safe_v3_name,
+    };
+
+    /// Slashed categories are escaped on write and restored on read; legacy ones are unchanged.
+    #[test]
+    fn categories_escape_and_roundtrip() {
+        assert!(is_safe_v3_category("cloudflare/zone"));
+        assert!(!is_safe_v3_category("cloudflare//zone"));
+        assert!(!is_safe_v3_category("a%2Fb"));
+        assert_eq!(encode_v3_category("cloudflare/zone"), "cloudflare%2Fzone");
+        assert!(!encode_v3_category("cloudflare/zone").contains('/'));
+        assert_eq!(decode_v3_category("cloudflare%2Fzone"), "cloudflare/zone");
+        assert_eq!(decode_v3_category("engram-rust"), "engram-rust");
+        // Escaped `cloudflare/zone` + `api-token` cannot collide with `cloudflare` + `zone/api-token`.
+        let a = format!(
+            "{}/{} = ",
+            encode_v3_category("cloudflare/zone"),
+            "api-token"
+        );
+        let b = format!(
+            "{}/{} = ",
+            encode_v3_category("cloudflare"),
+            "zone/api-token"
+        );
+        assert_ne!(a, b);
+    }
+
+    /// Categories stay strict: no slash, no spaces, no separators.
+    #[test]
+    fn categories_reject_slashes_and_separators() {
+        assert!(is_safe_ident("cloudflare"));
+        assert!(!is_safe_ident("cloudflare/zone"));
+        assert!(!is_safe_ident("a = b"));
+        assert!(!is_safe_ident(""));
+    }
+
+    /// Names may contain inner slashes but never empty segments or separators.
+    #[test]
+    fn names_allow_inner_slashes_only() {
+        assert!(is_safe_v3_name("zone/api-token"));
+        assert!(is_safe_v3_name("example-bot/bot-secret/api-key"));
+        assert!(!is_safe_v3_name("/lead"));
+        assert!(!is_safe_v3_name("trail/"));
+        assert!(!is_safe_v3_name("a//b"));
+        assert!(!is_safe_v3_name("a = b"));
+        assert!(!is_safe_v3_name("a b"));
+        assert!(!is_safe_v3_name(""));
+    }
+
+    /// A slash in the name cannot collide with another entry, because the
+    /// category may not contain one: `c/a` + `b` is rejected outright.
+    #[test]
+    fn no_category_name_collision() {
+        assert!(!is_safe_ident("c/a"));
+        assert!(is_safe_ident("c") && is_safe_v3_name("a/b"));
+    }
 }

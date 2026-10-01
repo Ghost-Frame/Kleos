@@ -198,6 +198,80 @@ enum Commands {
         #[command(subcommand)]
         cmd: BootstrapCmd,
     },
+    /// Re-encrypt every stored secret and bootstrap.enc from the current
+    /// master key (--auth-mode) to the key derived by --to. Stop phylaxd and
+    /// credd first. Prints counts only, never secret values.
+    Rekey {
+        /// Target auth mode: yubikey, password, or keyfile.
+        #[arg(long)]
+        to: String,
+        /// Keyfile for the target key when --to keyfile.
+        #[arg(long)]
+        new_keyfile: Option<PathBuf>,
+        /// Prove every row decrypts with the current key and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Move this host's vault to another challenge file (same YubiKey secret):
+    /// re-keys the encrypted vault file, every secret, and bootstrap.enc, then
+    /// installs the new challenge. Stop phylaxd/credd first. Original files
+    /// are kept as *.pre-rekey. Prints counts only.
+    RekeyChallenge {
+        /// The 32-byte challenge file to adopt (e.g. a challenge shared by several hosts).
+        #[arg(long)]
+        new_challenge: PathBuf,
+        /// Verify everything on a temporary copy and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Copy secrets this vault lacks from another vault file that uses the
+    /// same secret key; report (never overwrite) names whose values differ.
+    MergeFrom {
+        /// The other vault file (e.g. a copy of another host's cred.db).
+        #[arg(long)]
+        other: PathBuf,
+        /// Report what would change without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Import central CRED:v3 entries missing locally. Reads
+    /// `kleos-cli list --category credential --json` on stdin.
+    V3Import {
+        /// Hex keyfile that decrypts the central entries to import. Defaults
+        /// to this host's own key, which pulls entries written by any host
+        /// sharing it.
+        #[arg(long)]
+        source_keyfile: Option<PathBuf>,
+        /// Report what would change without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Print every local secret as a central CRED:v3 memory content line,
+    /// encrypted with this host's secret key (ciphertext only), for
+    /// `kleos-cli store --category credential --is-static`.
+    V3Export,
+    /// Report which keys can open the central CRED:v3 entries. Reads the JSON
+    /// from `kleos-cli list --category credential --json` on stdin and prints
+    /// only counts and entry names, never values.
+    V3Audit {
+        /// Extra hex keyfiles to test besides the current key (repeatable).
+        #[arg(long = "also-keyfile")]
+        also_keyfiles: Vec<PathBuf>,
+        /// Extra 32-byte challenge files (from other machines) to test through
+        /// the attached YubiKey's slot-2 secret (repeatable).
+        #[arg(long = "also-challenge")]
+        also_challenges: Vec<PathBuf>,
+        /// List entry names per group instead of per-service counts.
+        #[arg(long)]
+        names: bool,
+    },
+    /// Passphrase-protected backup of the vault master key, for recovering
+    /// the vault onto a replacement YubiKey. Passphrases are read from the
+    /// terminal only; nothing secret is printed.
+    RecoveryKit {
+        #[command(subcommand)]
+        cmd: RecoveryKitCmd,
+    },
     /// Manage YubiKey PIV slots for ECDH bootstrap auth.
     /// See kleos-cred/src/piv.rs for the implementation.
     Piv {
@@ -295,6 +369,32 @@ enum SessionCmd {
         /// Token to revoke. Defaults to `$CRED_GET_SESSION_TOKEN`.
         #[arg(long)]
         token: Option<String>,
+    },
+}
+
+/// Recovery-kit operations for the vault master key.
+#[derive(Subcommand)]
+enum RecoveryKitCmd {
+    /// Wrap the current master key (from --auth-mode) into a new kit file.
+    Create {
+        /// Output path; must not exist. Store the file off this machine.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Check that a kit and its passphrase open this vault.
+    Verify {
+        /// Kit file to check.
+        #[arg(long)]
+        from: PathBuf,
+    },
+    /// Turn a kit back into a 0600 hex keyfile for `--auth-mode keyfile`.
+    Restore {
+        /// Kit file to read.
+        #[arg(long)]
+        from: PathBuf,
+        /// Keyfile path to create; must not exist.
+        #[arg(long)]
+        out: PathBuf,
     },
 }
 
@@ -727,6 +827,46 @@ async fn main() -> Result<()> {
         Commands::Session { cmd } => cmd_session(cmd).await,
         Commands::Piv { cmd } => cmd_piv(cmd).await,
         Commands::SshCa { cmd } => cmd_ssh_ca(cmd).await,
+        Commands::Rekey {
+            to,
+            new_keyfile,
+            dry_run,
+        } => cmd_rekey(
+            &cli.auth_mode,
+            cli.master_password.as_deref(),
+            cli.keyfile.as_deref(),
+            &to,
+            new_keyfile.as_deref(),
+            dry_run,
+        ),
+        Commands::RekeyChallenge {
+            new_challenge,
+            dry_run,
+        } => cmd_rekey_challenge(&cli.auth_mode, &new_challenge, dry_run),
+        Commands::MergeFrom { other, dry_run } => cmd_merge_from(&other, dry_run),
+        Commands::V3Export => cmd_v3_export(),
+        Commands::V3Import {
+            source_keyfile,
+            dry_run,
+        } => cmd_v3_import(source_keyfile.as_deref(), dry_run),
+        Commands::V3Audit {
+            also_keyfiles,
+            also_challenges,
+            names,
+        } => cmd_v3_audit(
+            &cli.auth_mode,
+            cli.master_password.as_deref(),
+            cli.keyfile.as_deref(),
+            &also_keyfiles,
+            &also_challenges,
+            names,
+        ),
+        Commands::RecoveryKit { cmd } => cmd_recovery_kit(
+            &cli.auth_mode,
+            cli.master_password.as_deref(),
+            cli.keyfile.as_deref(),
+            cmd,
+        ),
         cmd => {
             // Resolve encryption config. ENGRAM_ENCRYPTION_MODE wins; when it is
             // absent (e.g. an agent process launched before the vault was
@@ -874,10 +1014,494 @@ async fn main() -> Result<()> {
                 | Commands::Recover { .. }
                 | Commands::Session { .. }
                 | Commands::Piv { .. }
-                | Commands::SshCa { .. } => unreachable!(),
+                | Commands::SshCa { .. }
+                | Commands::Rekey { .. }
+                | Commands::RecoveryKit { .. }
+                | Commands::V3Audit { .. }
+                | Commands::RekeyChallenge { .. }
+                | Commands::MergeFrom { .. }
+                | Commands::V3Import { .. }
+                | Commands::V3Export => unreachable!(),
             }
         }
     }
+}
+
+/// Move the vault to a new challenge file: vault file, secrets, bootstrap, challenge.
+fn cmd_rekey_challenge(auth_mode: &str, new_challenge_path: &Path, dry_run: bool) -> Result<()> {
+    use kleos_cred::rekey::{
+        count_decryptable_in, install_challenge, rekey_bootstrap, rekey_vault_file,
+        BootstrapOutcome,
+    };
+
+    if auth_mode != "yubikey" {
+        anyhow::bail!("rekey-challenge applies only to yubikey mode (current: {auth_mode})");
+    }
+    let current_path = yubikey::active_challenge_path()
+        .context("this host has no challenge file; refusing to create one")?;
+    let current =
+        std::fs::read(&current_path).with_context(|| format!("read {}", current_path.display()))?;
+    let target = std::fs::read(new_challenge_path)
+        .with_context(|| format!("read {}", new_challenge_path.display()))?;
+    if current.len() != yubikey::CHALLENGE_SIZE || target.len() != yubikey::CHALLENGE_SIZE {
+        anyhow::bail!("challenge files must be {} bytes", yubikey::CHALLENGE_SIZE);
+    }
+    if current == target {
+        anyhow::bail!(
+            "{} already holds that challenge; nothing to do",
+            current_path.display()
+        );
+    }
+    let at_rest_mode = std::env::var("ENGRAM_ENCRYPTION_MODE")
+        .ok()
+        .map(|m| m.to_ascii_lowercase())
+        .or_else(|| {
+            kleos_cred::encryption::read_persisted_encryption_mode()
+                .map(|m| format!("{m:?}").to_ascii_lowercase())
+        })
+        .unwrap_or_else(|| "none".into());
+    let at_rest_yubikey = match at_rest_mode.as_str() {
+        "yubikey" => true,
+        "none" => false,
+        other => anyhow::bail!("unsupported at-rest mode {other}; only none or yubikey"),
+    };
+
+    eprintln!("deriving current and target keys through the YubiKey...");
+    let old_response = Zeroizing::new(yubikey::challenge_response(&current)?);
+    let new_response = Zeroizing::new(yubikey::challenge_response(&target)?);
+    #[allow(deprecated)]
+    let old_key = Zeroizing::new(derive_key_legacy(&old_response[..]));
+    #[allow(deprecated)]
+    let new_key = Zeroizing::new(derive_key_legacy(&new_response[..]));
+    let (old_at_rest, new_at_rest) = if at_rest_yubikey {
+        (
+            Some(at_rest_key_from_response(&old_response[..])?),
+            Some(at_rest_key_from_response(&new_response[..])?),
+        )
+    } else {
+        (None, None)
+    };
+
+    let db = db_path();
+    let report = rekey_vault_file(
+        &db,
+        old_at_rest.as_deref(),
+        new_at_rest.as_deref(),
+        &old_key,
+        &new_key,
+        dry_run,
+    )?;
+    eprintln!(
+        "vault: {} secrets ({} re-encrypted, {} already on the target key), at-rest {}",
+        report.rows,
+        report.rotated,
+        report.already_new,
+        if at_rest_yubikey {
+            "SQLCipher re-keyed"
+        } else {
+            "plaintext file"
+        }
+    );
+    let bootstrap = rekey_bootstrap(&bootstrap_default_path(), &old_key, &new_key, dry_run)?;
+    match &bootstrap {
+        BootstrapOutcome::Absent => eprintln!("bootstrap.enc: absent"),
+        BootstrapOutcome::Verified => eprintln!("bootstrap.enc: decrypts with the current key"),
+        BootstrapOutcome::Rewrapped { backup } => eprintln!(
+            "bootstrap.enc: rewrapped (original at {})",
+            backup.display()
+        ),
+    }
+    if dry_run {
+        eprintln!("dry run complete: verified on a temporary copy; nothing changed");
+        return Ok(());
+    }
+    let challenge_backup = install_challenge(&current_path, &target)?;
+    let (ok, total) = count_decryptable_in(&db, new_at_rest.as_deref(), &new_key)?;
+    eprintln!(
+        "installed new challenge at {} (old kept at {}); vault original kept at {}",
+        current_path.display(),
+        challenge_backup.display(),
+        report
+            .backup
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
+    );
+    eprintln!("verify: {ok}/{total} secrets decrypt with the new key");
+    if ok != total {
+        anyhow::bail!("post-rekey verification failed");
+    }
+    Ok(())
+}
+
+/// Derive the YubiKey-mode SQLCipher at-rest key from a slot-2 response.
+///
+/// Delegates to `encryption::resolve_at_rest_key` so the derivation has a
+/// single source of truth shared with the normal open path.
+fn at_rest_key_from_response(response: &[u8]) -> Result<Zeroizing<[u8; KEY_SIZE]>> {
+    let mut config = kleos_lib::config::Config::from_env();
+    config.encryption.mode = kleos_lib::config::EncryptionMode::Yubikey;
+    let key = kleos_cred::encryption::resolve_at_rest_key(&config, Some(response))?
+        .context("yubikey at-rest mode produced no key")?;
+    Ok(Zeroizing::new(key))
+}
+
+/// This host's vault keys: (secret master key, optional SQLCipher at-rest key).
+type VaultKeys = (Zeroizing<[u8; KEY_SIZE]>, Option<Zeroizing<[u8; KEY_SIZE]>>);
+
+/// Derive this host's vault keys from its active challenge through the YubiKey.
+fn local_vault_keys() -> Result<VaultKeys> {
+    let path = yubikey::active_challenge_path().context("this host has no challenge file")?;
+    let challenge = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+    let response = Zeroizing::new(yubikey::challenge_response(&challenge)?);
+    #[allow(deprecated)]
+    let master = Zeroizing::new(derive_key_legacy(&response[..]));
+    let at_rest_yubikey = std::env::var("ENGRAM_ENCRYPTION_MODE")
+        .map(|m| m.eq_ignore_ascii_case("yubikey"))
+        .unwrap_or_else(|_| {
+            kleos_cred::encryption::read_persisted_encryption_mode()
+                .map(|m| format!("{m:?}").eq_ignore_ascii_case("yubikey"))
+                .unwrap_or(false)
+        });
+    let at_rest = if at_rest_yubikey {
+        Some(at_rest_key_from_response(&response[..])?)
+    } else {
+        None
+    };
+    Ok((master, at_rest))
+}
+
+/// Print a merge report: counts plus names, never values.
+fn print_merge_report(report: &kleos_cred::rekey::MergeReport, dry_run: bool) {
+    let verb = if dry_run { "would import" } else { "imported" };
+    eprintln!(
+        "{verb} {}, identical {}, differing {}, undecryptable {}",
+        report.imported.len(),
+        report.identical,
+        report.differing.len(),
+        report.undecryptable.len()
+    );
+    for (label, names) in [
+        (verb, &report.imported),
+        ("DIFFERS (left as is)", &report.differing),
+        ("undecryptable", &report.undecryptable),
+    ] {
+        for name in names {
+            eprintln!("    {label}: {name}");
+        }
+    }
+}
+
+/// Merge another same-key vault file into this host's vault.
+fn cmd_merge_from(other: &Path, dry_run: bool) -> Result<()> {
+    let (master, at_rest) = local_vault_keys()?;
+    let report = kleos_cred::rekey::merge_vault(
+        &db_path(),
+        at_rest.as_deref(),
+        other,
+        at_rest.as_deref(),
+        &master,
+        dry_run,
+    )?;
+    print_merge_report(&report, dry_run);
+    Ok(())
+}
+
+/// Print local secrets as central v3 contents (ciphertext only) on stdout.
+fn cmd_v3_export() -> Result<()> {
+    let (master, at_rest) = local_vault_keys()?;
+    let (contents, skipped) =
+        kleos_cred::rekey::export_v3_contents(&db_path(), at_rest.as_deref(), &master)?;
+    let mut out = io::stdout().lock();
+    for line in &contents {
+        writeln!(out, "{line}")?;
+    }
+    eprintln!(
+        "exported {} entries; skipped {}",
+        contents.len(),
+        skipped.len()
+    );
+    for name in &skipped {
+        eprintln!("    skipped: {name}");
+    }
+    Ok(())
+}
+
+/// Import central v3 entries that are missing locally.
+fn cmd_v3_import(source_keyfile: Option<&Path>, dry_run: bool) -> Result<()> {
+    let mut raw = String::new();
+    io::stdin().read_to_string(&mut raw)?;
+    let json: serde_json::Value =
+        serde_json::from_str(&raw).context("stdin is not a Kleos /list JSON response")?;
+    let (entries, _) = kleos_cred::rekey::parse_v3_listing(&json);
+    let (master, at_rest) = local_vault_keys()?;
+    let source = match source_keyfile {
+        Some(path) => derive_master_key("keyfile", None, Some(path))?,
+        None => master.clone(),
+    };
+    let report = kleos_cred::rekey::import_v3_entries(
+        &db_path(),
+        at_rest.as_deref(),
+        &master,
+        &entries,
+        &source,
+        dry_run,
+    )?;
+    print_merge_report(&report, dry_run);
+    Ok(())
+}
+
+/// Summarize which candidate keys open the central CRED:v3 entries on stdin.
+fn cmd_v3_audit(
+    auth_mode: &str,
+    master_password: Option<&str>,
+    keyfile: Option<&Path>,
+    also_keyfiles: &[PathBuf],
+    also_challenges: &[PathBuf],
+    names: bool,
+) -> Result<()> {
+    use kleos_cred::rekey::{parse_v3_listing, v3_opens_with};
+    use std::collections::BTreeMap;
+
+    let mut raw = String::new();
+    io::stdin().read_to_string(&mut raw)?;
+    let json: serde_json::Value =
+        serde_json::from_str(&raw).context("stdin is not a Kleos /list JSON response")?;
+    let (entries, malformed) = parse_v3_listing(&json);
+
+    let mut keys: Vec<(String, Zeroizing<[u8; KEY_SIZE]>)> = vec![(
+        format!("current ({auth_mode})"),
+        derive_master_key(auth_mode, master_password, keyfile)?,
+    )];
+    for path in also_keyfiles {
+        keys.push((
+            path.display().to_string(),
+            derive_master_key("keyfile", None, Some(path))?,
+        ));
+    }
+    for path in also_challenges {
+        let challenge = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+        if challenge.len() != yubikey::CHALLENGE_SIZE {
+            anyhow::bail!(
+                "{} is not a {}-byte challenge file",
+                path.display(),
+                yubikey::CHALLENGE_SIZE
+            );
+        }
+        let response = Zeroizing::new(yubikey::challenge_response(&challenge)?);
+        #[allow(deprecated)]
+        let key = Zeroizing::new(derive_key_legacy(&response[..]));
+        keys.push((format!("yubikey + challenge {}", path.display()), key));
+    }
+
+    let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for entry in &entries {
+        let label = keys
+            .iter()
+            .find(|(_, key)| v3_opens_with(key, &entry.blob))
+            .map(|(label, _)| label.clone())
+            .unwrap_or_else(|| "NO KEY TESTED".to_string());
+        groups.entry(label).or_default().push(match entry.id {
+            Some(id) => format!("{}/{} #{id}", entry.category, entry.name),
+            None => format!("{}/{}", entry.category, entry.name),
+        });
+    }
+    // Value check: for every entry an extra key opens, compare its plaintext with
+    // the entry the current key opens for the same name (fingerprints only).
+    if keys.len() > 1 {
+        let current = &keys[0].1;
+        let mut current_values: BTreeMap<(String, String), Vec<u8>> = BTreeMap::new();
+        for entry in &entries {
+            if let Ok(plain) = kleos_cred::crypto::decrypt(current, &entry.blob) {
+                current_values.insert(
+                    (entry.category.clone(), entry.name.clone()),
+                    Sha256::digest(&plain).to_vec(),
+                );
+            }
+        }
+        let (mut same, mut differ, mut no_current) = (0usize, Vec::new(), Vec::new());
+        for entry in &entries {
+            for (label, key) in keys.iter().skip(1) {
+                if let Ok(plain) = kleos_cred::crypto::decrypt(key, &entry.blob) {
+                    let tag = format!(
+                        "{}/{} #{} ({label})",
+                        entry.category,
+                        entry.name,
+                        entry.id.unwrap_or(0)
+                    );
+                    match current_values.get(&(entry.category.clone(), entry.name.clone())) {
+                        Some(digest) if *digest == Sha256::digest(&plain).to_vec() => same += 1,
+                        Some(_) => differ.push(tag),
+                        None => no_current.push(tag),
+                    }
+                    break;
+                }
+            }
+        }
+        eprintln!(
+            "value check vs current key: identical {same}, DIFFERENT {}, no current-key copy {}",
+            differ.len(),
+            no_current.len()
+        );
+        for tag in differ.iter().chain(no_current.iter()) {
+            eprintln!("    check: {tag}");
+        }
+    }
+    let unique: std::collections::BTreeSet<_> =
+        entries.iter().map(|e| (&e.category, &e.name)).collect();
+    eprintln!(
+        "central v3 entries: {} ({} unique names, {} non-v3/malformed memories)",
+        entries.len(),
+        unique.len(),
+        malformed
+    );
+    for (label, members) in &groups {
+        eprintln!("opens with {label}: {}", members.len());
+        if names {
+            for member in members {
+                eprintln!("    {member}");
+            }
+        } else {
+            let mut services: BTreeMap<&str, usize> = BTreeMap::new();
+            for member in members {
+                *services
+                    .entry(member.split('/').next().unwrap_or("?"))
+                    .or_default() += 1;
+            }
+            let summary: Vec<String> = services.iter().map(|(s, n)| format!("{s}:{n}")).collect();
+            eprintln!("    {}", summary.join(" "));
+        }
+    }
+    Ok(())
+}
+
+/// Read a passphrase from the controlling terminal, refusing piped input.
+fn read_terminal_passphrase(prompt: &str) -> Result<Zeroizing<String>> {
+    if !io::stdin().is_terminal() {
+        anyhow::bail!("recovery passphrases must be typed at an interactive terminal");
+    }
+    Ok(Zeroizing::new(rpassword::prompt_password(prompt)?))
+}
+
+/// Create, verify, or restore a passphrase-wrapped master-key recovery kit.
+fn cmd_recovery_kit(
+    auth_mode: &str,
+    master_password: Option<&str>,
+    keyfile: Option<&Path>,
+    cmd: RecoveryKitCmd,
+) -> Result<()> {
+    use kleos_cred::rekey::{
+        keys_match, unwrap_master_key, wrap_master_key, write_new_private_file,
+    };
+
+    match cmd {
+        RecoveryKitCmd::Create { out } => {
+            if out.exists() {
+                anyhow::bail!("{} already exists; refusing to overwrite", out.display());
+            }
+            let master = derive_master_key(auth_mode, master_password, keyfile)?;
+            let passphrase = read_terminal_passphrase("recovery passphrase (12+ chars): ")?;
+            let confirm = read_terminal_passphrase("confirm passphrase: ")?;
+            if passphrase.as_str() != confirm.as_str() {
+                anyhow::bail!("passphrases do not match");
+            }
+            let blob = wrap_master_key(&passphrase, &master)?;
+            if !keys_match(&*unwrap_master_key(&passphrase, &blob)?, &master) {
+                anyhow::bail!("recovery kit self-check failed");
+            }
+            write_new_private_file(&out, &blob)?;
+            eprintln!(
+                "recovery kit written to {} (0600); self-check passed",
+                out.display()
+            );
+            eprintln!("copy it OFF this machine (password manager or offline USB) and delete the local copy");
+            Ok(())
+        }
+        RecoveryKitCmd::Verify { from } => {
+            let blob = std::fs::read(&from).with_context(|| format!("read {}", from.display()))?;
+            let passphrase = read_terminal_passphrase("recovery passphrase: ")?;
+            let recovered = unwrap_master_key(&passphrase, &blob)?;
+            let master = derive_master_key(auth_mode, master_password, keyfile)?;
+            if keys_match(&recovered, &master) {
+                eprintln!("MATCH: this kit opens the current vault");
+                Ok(())
+            } else {
+                anyhow::bail!("MISMATCH: this kit does not hold the current vault key")
+            }
+        }
+        RecoveryKitCmd::Restore { from, out } => {
+            let blob = std::fs::read(&from).with_context(|| format!("read {}", from.display()))?;
+            let passphrase = read_terminal_passphrase("recovery passphrase: ")?;
+            let recovered = unwrap_master_key(&passphrase, &blob)?;
+            let hex_key = Zeroizing::new(hex::encode(recovered.as_slice()));
+            write_new_private_file(&out, hex_key.as_bytes())?;
+            eprintln!("keyfile written to {} (0600)", out.display());
+            eprintln!("next: cred --auth-mode keyfile --keyfile {} rekey --to yubikey, then delete the keyfile", out.display());
+            Ok(())
+        }
+    }
+}
+
+/// Rotate the local vault from the current master key to the `--to` key.
+///
+/// Opens SQLite directly (no Kleos migrations), refuses at-rest encrypted
+/// caches, and reports only counts and failing row identifiers.
+fn cmd_rekey(
+    auth_mode: &str,
+    master_password: Option<&str>,
+    keyfile: Option<&Path>,
+    to: &str,
+    new_keyfile: Option<&Path>,
+    dry_run: bool,
+) -> Result<()> {
+    use kleos_cred::rekey::{count_decryptable, rekey_bootstrap, rekey_database, BootstrapOutcome};
+
+    if std::env::var("ENGRAM_ENCRYPTION_MODE").is_ok()
+        || kleos_cred::encryption::read_persisted_encryption_mode().is_some()
+    {
+        anyhow::bail!("rekey supports only a plaintext-at-rest cache; this vault is configured for at-rest encryption");
+    }
+    eprintln!("deriving current key ({auth_mode})...");
+    let old_key = derive_master_key(auth_mode, master_password, keyfile)?;
+    eprintln!("deriving target key ({to})...");
+    let new_key = derive_master_key(to, None, new_keyfile)?;
+
+    let db = db_path();
+    let report = rekey_database(&db, &old_key, &new_key, dry_run)?;
+    // Match credd/phylaxd: CREDD_BOOTSTRAP_BLOB overrides the default location.
+    let bootstrap_path = std::env::var("CREDD_BOOTSTRAP_BLOB")
+        .ok()
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(bootstrap_default_path);
+    let bootstrap = rekey_bootstrap(&bootstrap_path, &old_key, &new_key, dry_run)?;
+    if dry_run {
+        eprintln!(
+            "dry run: {} secrets would be re-encrypted, {} are already under the target key, {} total; nothing changed",
+            report.rotated, report.already_new, report.rows
+        );
+    } else {
+        let (new_ok, total) = count_decryptable(&db, &new_key)?;
+        let (old_ok, _) = count_decryptable(&db, &old_key)?;
+        eprintln!(
+            "re-encrypted {} secrets ({} already under the target key); verify: {new_ok}/{total} decrypt with the new key, {old_ok} with the old key",
+            report.rotated, report.already_new
+        );
+        if new_ok != total || old_ok != 0 {
+            anyhow::bail!("post-rekey verification failed");
+        }
+    }
+    match bootstrap {
+        BootstrapOutcome::Absent => eprintln!("bootstrap.enc: absent"),
+        BootstrapOutcome::Verified => eprintln!("bootstrap.enc: decrypts with the current key"),
+        BootstrapOutcome::Rewrapped { backup } => {
+            eprintln!(
+                "bootstrap.enc: rewrapped; original kept at {}",
+                backup.display()
+            )
+        }
+    }
+    Ok(())
 }
 
 async fn cmd_export_key(master_key: &[u8; KEY_SIZE], out: Option<PathBuf>) -> Result<()> {

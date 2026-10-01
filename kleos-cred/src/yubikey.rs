@@ -141,8 +141,10 @@ pub fn challenge_response(challenge: &[u8]) -> Result<[u8; RESPONSE_SIZE]> {
         )));
     }
 
-    let mut response = [0u8; RESPONSE_SIZE];
-    response.copy_from_slice(&decoded);
+    let response: [u8; RESPONSE_SIZE] = decoded
+        .as_slice()
+        .try_into()
+        .map_err(|_| CredError::YubiKey("unexpected HMAC response length".into()))?;
     record_success();
     debug!("YubiKey challenge-response ok ({} bytes)", RESPONSE_SIZE);
     Ok(response)
@@ -327,6 +329,15 @@ pub fn software_hmac(secret: &[u8], challenge: &[u8; CHALLENGE_SIZE]) -> [u8; RE
     let mut response = [0u8; RESPONSE_SIZE];
     response.copy_from_slice(&out[..RESPONSE_SIZE]);
     response
+}
+
+/// Path of the challenge file this host currently uses, without creating one.
+///
+/// Returns `None` when no challenge file exists, so callers that must not
+/// silently fork the vault key (rotation, auditing) can refuse instead.
+pub fn active_challenge_path() -> Option<PathBuf> {
+    let path = config_dir().join(CHALLENGE_FILE);
+    path.exists().then_some(path)
 }
 
 /// Config directory for engram: `$XDG_CONFIG_HOME/engram` or
