@@ -884,6 +884,8 @@ pub const V3_PREFIX: &str = "[CRED:v3] ";
 /// One central-vault entry parsed from a Kleos memory listing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct V3Entry {
+    /// Kleos memory id of the entry, when the listing includes it.
+    pub id: Option<i64>,
     /// Service/category of the secret.
     pub category: String,
     /// Secret name.
@@ -912,6 +914,7 @@ pub fn parse_v3_listing(json: &serde_json::Value) -> (Vec<V3Entry>, usize) {
                 let (category, name) = path.split_once('/')?;
                 let blob = hex::decode(hex_data.trim()).ok()?;
                 Some(V3Entry {
+                    id: item.get("id").and_then(|v| v.as_i64()),
                     // Categories with `/` are stored escaped as `%2F` (phylaxd encode_v3_category).
                     category: category.replace("%2F", "/"),
                     name: name.to_string(),
@@ -1246,16 +1249,19 @@ mod tests {
         .unwrap();
         let entries = vec![
             V3Entry {
+                id: None,
                 category: "svc".into(),
                 name: "k0".into(),
                 blob: encrypt(&OLD, &record).unwrap(),
             },
             V3Entry {
+                id: None,
                 category: "git".into(),
                 name: "push".into(),
                 blob: encrypt(&OLD, &record).unwrap(),
             },
             V3Entry {
+                id: None,
                 category: "x".into(),
                 name: "locked".into(),
                 blob: encrypt(&[5u8; KEY_SIZE], &record).unwrap(),
