@@ -237,9 +237,11 @@ enum Commands {
     /// Import central CRED:v3 entries missing locally. Reads
     /// `kleos-cli list --category credential --json` on stdin.
     V3Import {
-        /// Hex keyfile that decrypts the central entries to import.
+        /// Hex keyfile that decrypts the central entries to import. Defaults
+        /// to this host's own key, which pulls entries written by any host
+        /// sharing it.
         #[arg(long)]
-        source_keyfile: PathBuf,
+        source_keyfile: Option<PathBuf>,
         /// Report what would change without writing.
         #[arg(long)]
         dry_run: bool,
@@ -846,7 +848,7 @@ async fn main() -> Result<()> {
         Commands::V3Import {
             source_keyfile,
             dry_run,
-        } => cmd_v3_import(&source_keyfile, dry_run),
+        } => cmd_v3_import(source_keyfile.as_deref(), dry_run),
         Commands::V3Audit {
             also_keyfiles,
             also_challenges,
@@ -1228,14 +1230,17 @@ fn cmd_v3_export() -> Result<()> {
 }
 
 /// Import central v3 entries that are missing locally.
-fn cmd_v3_import(source_keyfile: &Path, dry_run: bool) -> Result<()> {
+fn cmd_v3_import(source_keyfile: Option<&Path>, dry_run: bool) -> Result<()> {
     let mut raw = String::new();
     io::stdin().read_to_string(&mut raw)?;
     let json: serde_json::Value =
         serde_json::from_str(&raw).context("stdin is not a Kleos /list JSON response")?;
     let (entries, _) = kleos_cred::rekey::parse_v3_listing(&json);
-    let source = derive_master_key("keyfile", None, Some(source_keyfile))?;
     let (master, at_rest) = local_vault_keys()?;
+    let source = match source_keyfile {
+        Some(path) => derive_master_key("keyfile", None, Some(path))?,
+        None => master.clone(),
+    };
     let report = kleos_cred::rekey::import_v3_entries(
         &db_path(),
         at_rest.as_deref(),
