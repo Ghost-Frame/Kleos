@@ -449,10 +449,10 @@ The installer (`kleos-install` or `kleos-install-gui`) supports four profiles:
 
 [Wiki](https://github.com/Ghost-Frame/Kleos/wiki) · [Issues](https://github.com/Ghost-Frame/Kleos/issues)
 
-Elastic License 2.0
+PolyForm Noncommercial License 1.0.0
 
 </div>
 
 ### Commercial licensing
 
-The Elastic License 2.0 prohibits offering this software to third parties as a hosted or managed service. To sell, host, or distribute it on your own platform, contact us for a commercial license: support@syntheos.dev.
+Kleos is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE). Personal, hobby, research, and other noncommercial use is permitted. Any commercial use, including selling, reselling, hosting, bundling, or otherwise earning revenue from this software, requires a separate written commercial license. Contact support@syntheos.dev.

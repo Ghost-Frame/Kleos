@@ -4,7 +4,7 @@ version = "1.10.0"
 edition = "2021"
 autobins = false
 rust-version.workspace = true
-license = "Elastic-2.0"
+license = "PolyForm-Noncommercial-1.0.0"
 description = "AST-aware filesystem CLIs for AI agents -- kr (read), kw (write), ke (edit)"
 
 [[bin]]

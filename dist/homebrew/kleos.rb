@@ -14,7 +14,7 @@ class Kleos < Formula
   desc "Persistent semantic memory and cognitive infrastructure for AI agents"
   homepage "https://github.com/Ghost-Frame/Kleos"
   version "0.3.1"
-  license "Elastic-2.0"
+  license "PolyForm-Noncommercial-1.0.0"
 
   on_macos do
     if Hardware::CPU.arm?

@@ -4,7 +4,7 @@ version = "1.10.0"
 edition = "2021"
 rust-version.workspace = true
 description = "OpenSSH agent protocol server -- wire protocol and KeyProvider trait"
-license = "Elastic-2.0"
+license = "PolyForm-Noncommercial-1.0.0"
 
 [dependencies]
 tokio = { workspace = true, features = ["full"] }

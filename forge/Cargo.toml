@@ -3,7 +3,7 @@ name = "forge"
 version = "1.10.0"
 edition = "2021"
 rust-version.workspace = true
-license = "Elastic-2.0"
+license = "PolyForm-Noncommercial-1.0.0"
 description = "Agent tool runtime -- skill-driven dispatch for Kleos-authenticated tools"
 
 [[bin]]

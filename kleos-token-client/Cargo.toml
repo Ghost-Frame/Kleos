@@ -4,7 +4,7 @@ version = "1.10.0"
 edition = "2021"
 rust-version.workspace = true
 description = "Tiny std-only client for the phylaxd SO_PEERCRED Kleos token broker"
-license = "Elastic-2.0"
+license = "PolyForm-Noncommercial-1.0.0"
 
 # Intentionally dependency-free: lightweight bearer-only tools (kr/kw/ke,
 # kleos-sh, agent-forge, eidolon-supervisor) link this without pulling kleos-lib.

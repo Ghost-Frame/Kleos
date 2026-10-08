@@ -62,7 +62,7 @@ FROM debian:bookworm-slim AS runtime
 
 LABEL org.opencontainers.image.source="https://github.com/Ghost-Frame/Kleos" \
       org.opencontainers.image.description="Kleos memory server (formerly Engram) -- personal knowledge graph and semantic memory store" \
-      org.opencontainers.image.licenses="Elastic-2.0"
+      org.opencontainers.image.licenses="PolyForm-Noncommercial-1.0.0"
 
 # Install runtime dependencies:
 #   libssl3     -- required by reqwest (native-tls)
@@ -118,7 +118,7 @@ FROM debian:bookworm-slim AS sidecar
 
 LABEL org.opencontainers.image.source="https://github.com/Ghost-Frame/Kleos" \
       org.opencontainers.image.description="Kleos sidecar -- local batching proxy for observations, session recall, and Claude session-file watching" \
-      org.opencontainers.image.licenses="Elastic-2.0"
+      org.opencontainers.image.licenses="PolyForm-Noncommercial-1.0.0"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 \

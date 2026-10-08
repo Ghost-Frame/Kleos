@@ -4,7 +4,7 @@ version = "1.10.0"
 edition = "2021"
 rust-version.workspace = true
 description = "Shared Kleos configuration types and environment resolution, used by both the server (kleos-lib) and the installer so the two never drift"
-license = "Elastic-2.0"
+license = "PolyForm-Noncommercial-1.0.0"
 
 [dependencies]
 serde = { workspace = true }

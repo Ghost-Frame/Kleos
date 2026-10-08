@@ -4,7 +4,7 @@ version = "1.10.0"
 edition = "2021"
 rust-version.workspace = true
 description = "Shared core logic for the Kleos interactive installer"
-license = "Elastic-2.0"
+license = "PolyForm-Noncommercial-1.0.0"
 
 [dependencies]
 kleos-config = { path = "../kleos-config", version = "1.10.0" }

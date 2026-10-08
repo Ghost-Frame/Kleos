@@ -3,7 +3,7 @@ name = "agent-forge"
 version = "1.10.0"
 edition = "2021"
 rust-version.workspace = true
-license = "Elastic-2.0"
+license = "PolyForm-Noncommercial-1.0.0"
 description = "Protocol CLI that gates agent coding work behind spec + hypothesis + verification steps"
 
 [features]

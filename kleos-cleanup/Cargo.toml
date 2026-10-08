@@ -3,7 +3,7 @@ name = "kleos-cleanup"
 version = "1.10.0"
 edition = "2021"
 publish = false
-license = "MIT"
+license = "PolyForm-Noncommercial-1.0.0"
 
 [dependencies]
 rusqlite = { workspace = true, features = ["bundled-sqlcipher"] }

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
 //! HTTP-backed KeyProvider that proxies list/sign requests to phylaxd.
 
