@@ -35,11 +35,6 @@ impl AgentKey {
         }
         self.permissions.allows_category(category)
     }
-
-    /// Check if this key can use raw access tier.
-    pub fn can_access_raw(&self) -> bool {
-        self.is_valid() && self.permissions.allow_raw
-    }
 }
 
 /// Permissions for an agent key.
@@ -47,8 +42,6 @@ impl AgentKey {
 pub struct AgentKeyPermissions {
     /// Allowed category patterns (empty = all categories).
     pub categories: Vec<String>,
-    /// Whether raw access tier is allowed.
-    pub allow_raw: bool,
     /// Allowed namespace patterns (empty = all namespaces allowed).
     pub namespaces: Vec<String>,
     /// Set when the stored permissions blob failed to parse. Empty category and
@@ -103,10 +96,9 @@ impl AgentKeyPermissions {
     /// Construct permissions from explicit allow-lists (not from a stored blob).
     /// The `malformed` fail-closed flag stays private; use this from other crates
     /// instead of a struct literal.
-    pub fn new(categories: Vec<String>, allow_raw: bool, namespaces: Vec<String>) -> Self {
+    pub fn new(categories: Vec<String>, namespaces: Vec<String>) -> Self {
         Self {
             categories,
-            allow_raw,
             namespaces,
             malformed: false,
         }
@@ -116,13 +108,15 @@ impl AgentKeyPermissions {
     pub fn to_json(&self) -> String {
         serde_json::json!({
             "categories": self.categories,
-            "allow_raw": self.allow_raw,
             "namespaces": self.namespaces,
         })
         .to_string()
     }
 
     /// Deserialize from JSON.
+    ///
+    /// Rows written by older builds may carry an `allow_raw` key; it is
+    /// accepted and ignored (the capability no longer exists).
     pub fn from_json(json: &str) -> Self {
         // Fail closed: a permissions blob that does not parse must not widen
         // access. Empty category/namespace lists mean "all", so returning a
@@ -133,7 +127,6 @@ impl AgentKeyPermissions {
             Err(_) => {
                 return Self {
                     malformed: true,
-                    allow_raw: false,
                     categories: Vec::new(),
                     namespaces: Vec::new(),
                 };
@@ -148,10 +141,6 @@ impl AgentKeyPermissions {
                     .collect()
             })
             .unwrap_or_default();
-        let allow_raw = value
-            .get("allow_raw")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
         let namespaces = value
             .get("namespaces")
             .and_then(|v| v.as_array())
@@ -163,7 +152,6 @@ impl AgentKeyPermissions {
             .unwrap_or_default();
         Self {
             categories,
-            allow_raw,
             namespaces,
             malformed: false,
         }
@@ -392,7 +380,6 @@ mod tests {
     fn setup_permissions() -> AgentKeyPermissions {
         AgentKeyPermissions {
             categories: vec!["aws".into(), "gcp*".into()],
-            allow_raw: true,
             namespaces: vec!["prod".into(), "staging/*".into()],
             malformed: false,
         }
@@ -412,7 +399,6 @@ mod tests {
             !bad.allows_namespace("prod"),
             "malformed must deny namespaces"
         );
-        assert!(!bad.allow_raw, "malformed must deny raw");
         let empty = AgentKeyPermissions::from_json(r#"{"categories":[],"namespaces":[]}"#);
         assert!(
             empty.allows_category("aws"),
@@ -456,7 +442,6 @@ mod tests {
         let json = perms.to_json();
         let restored = AgentKeyPermissions::from_json(&json);
         assert_eq!(perms.categories, restored.categories);
-        assert_eq!(perms.allow_raw, restored.allow_raw);
         assert_eq!(perms.namespaces, restored.namespaces);
     }
 
@@ -490,7 +475,6 @@ mod tests {
     fn permissions_namespace_star_allows_all() {
         let perms = AgentKeyPermissions {
             categories: vec![],
-            allow_raw: false,
             namespaces: vec!["*".into()],
             malformed: false,
         };
@@ -503,10 +487,22 @@ mod tests {
     #[test]
     fn permissions_json_backward_compat_missing_namespaces() {
         // Old JSON without "namespaces" field should deserialize to empty vec (all allowed).
-        let json = r#"{"categories":["aws"],"allow_raw":false}"#;
+        let json = r#"{"categories":["aws"]}"#;
         let perms = AgentKeyPermissions::from_json(json);
         assert!(perms.namespaces.is_empty());
         assert!(perms.allows_namespace("any-namespace"));
+    }
+
+    /// A legacy blob carrying `allow_raw` still parses (key ignored) and the
+    /// capability is never re-serialized.
+    #[test]
+    fn legacy_allow_raw_key_is_ignored_and_not_rewritten() {
+        let perms = AgentKeyPermissions::from_json(
+            r#"{"categories":["aws"],"allow_raw":true,"namespaces":["prod"]}"#,
+        );
+        assert_eq!(perms.categories, vec!["aws".to_string()]);
+        assert_eq!(perms.namespaces, vec!["prod".to_string()]);
+        assert!(!perms.to_json().contains("allow_raw"));
     }
 
     /// Key generation yields a 32-byte key and a matching SHA-256 hex hash.

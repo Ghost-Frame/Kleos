@@ -140,7 +140,8 @@ pub async fn get_handler(
 ) -> Result<Json<Value>, AppError> {
     // This legacy endpoint returns the secret plaintext directly and is not
     // intercepted by Phylax resolve policy. Keep it master-only so an agent
-    // cannot use allow_raw to bypass approval or non-plaintext enforcement.
+    // cannot bypass approval or non-plaintext enforcement. Not mounted at all
+    // under the custody profile.
     if !auth.is_master() {
         log_audit(
             &state.db,

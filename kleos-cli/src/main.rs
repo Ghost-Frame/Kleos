@@ -762,9 +762,6 @@ enum CredCommands {
         /// Allowed categories (comma-separated, empty = all)
         #[arg(short, long)]
         categories: Option<String>,
-        /// Allow raw access tier
-        #[arg(long)]
-        allow_raw: bool,
     },
     /// List agent keys
     AgentList,
@@ -3358,11 +3355,7 @@ async fn handle_cred_command(client: &Client, cmd: &CredCommands) {
             }
         }
 
-        CredCommands::AgentCreate {
-            name,
-            categories,
-            allow_raw,
-        } => {
+        CredCommands::AgentCreate { name, categories } => {
             let cats: Vec<String> = categories
                 .as_deref()
                 .unwrap_or("")
@@ -3374,7 +3367,6 @@ async fn handle_cred_command(client: &Client, cmd: &CredCommands) {
             let body = json!({
                 "name": name,
                 "categories": cats,
-                "allow_raw": allow_raw,
             });
 
             match client.post("/agents", body).await {

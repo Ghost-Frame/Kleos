@@ -16,6 +16,8 @@ use zeroize::Zeroizing;
 use kleos_cred::agent_keys_file::FileAgentKeyStore;
 use kleos_lib::auth_piv::RequestSigner;
 
+use crate::profile::RunProfile;
+
 /// Per-category domain allowlist for the credential proxy.
 ///
 /// When present, the proxy only forwards requests to domains listed for
@@ -57,6 +59,9 @@ pub struct AppState {
     /// Per-category domain allowlist for proxy requests. When `Some`, the
     /// proxy denies requests to domains not listed for the category.
     pub proxy_domain_allowlist: Option<Arc<ProxyDomainAllowlist>>,
+    /// Run profile the daemon was started with. Decides which routes are
+    /// mounted and whether the master bearer is accepted over TCP.
+    pub run_profile: RunProfile,
 }
 
 impl AppState {
@@ -72,7 +77,14 @@ impl AppState {
             piv_9d_pubkey,
             kleos_signer: None,
             proxy_domain_allowlist: load_proxy_domain_allowlist(),
+            run_profile: RunProfile::Legacy,
         }
+    }
+
+    /// Return this state with `profile` installed as the run profile.
+    pub fn with_run_profile(mut self, profile: RunProfile) -> Self {
+        self.run_profile = profile;
+        self
     }
 
     /// Constructor variant that includes the bootstrap bearer (loaded by
@@ -96,6 +108,7 @@ impl AppState {
             piv_9d_pubkey,
             kleos_signer,
             proxy_domain_allowlist: load_proxy_domain_allowlist(),
+            run_profile: RunProfile::Legacy,
         }
     }
 }
