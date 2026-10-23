@@ -1,5 +1,6 @@
 pub mod bootstrap;
 pub mod client;
+pub mod custody_client;
 pub mod pattern;
 pub mod proxy;
 pub mod types;

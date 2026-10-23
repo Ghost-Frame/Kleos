@@ -274,10 +274,16 @@ Token resolution:
 - `~/.config/cred/credd-agent-key.token`
 - fallback to the current Kleos bearer if neither exists
 
-#### `kleos-cli cred get CATEGORY NAME [--raw]`
+#### Custody mode (`CRED_CUSTODY`)
 
-- Calls `GET /secret/{category}/{name}` on the credential authority.
-- `--raw` extracts the primary value field from the secret object.
+- The `kleos-cli cred` print-a-secret verb was removed: this CLI never prints
+  a stored secret.
+- When `CRED_CUSTODY` is set (`host:port` or a full URL; plain http only for
+  loopback, https otherwise), `cred set`, `cred list` and `cred delete` go
+  through the custody thin client using the agent key only
+  (`CREDD_AGENT_KEY`, then `~/.config/cred/credd-agent-key.token`).
+- `cred exec` under custody exits 2 with
+  `custody exec is not available until the credential issuer lands (phase 2)`.
 
 #### `kleos-cli cred set CATEGORY NAME [--secret-type TYPE] [--value V] [--username U] [--url URL]`
 
