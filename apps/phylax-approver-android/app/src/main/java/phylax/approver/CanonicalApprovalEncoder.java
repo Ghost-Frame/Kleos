@@ -52,17 +52,25 @@ public final class CanonicalApprovalEncoder {
         }
 
         ByteArrayOutputStream output = new ByteArrayOutputStream(160 + deviceBytes.length);
-        output.writeBytes(DOMAIN);
-        output.writeBytes(longBytes(version));
-        output.writeBytes(longBytes(approvalId));
-        output.writeBytes(nonce);
-        output.writeBytes(requestDigest);
+        put(output, DOMAIN);
+        put(output, longBytes(version));
+        put(output, longBytes(approvalId));
+        put(output, nonce);
+        put(output, requestDigest);
         output.write(decision);
-        output.writeBytes(intBytes(deviceBytes.length));
-        output.writeBytes(deviceBytes);
-        output.writeBytes(longBytes(issuedAt));
-        output.writeBytes(longBytes(expiresAt));
+        put(output, intBytes(deviceBytes.length));
+        put(output, deviceBytes);
+        put(output, longBytes(issuedAt));
+        put(output, longBytes(expiresAt));
         return output.toByteArray();
+    }
+
+    /**
+     * Append a whole byte array. ByteArrayOutputStream#writeBytes needs API 33,
+     * and minSdk is 31, so this uses the API 1 three-argument write instead.
+     */
+    private static void put(ByteArrayOutputStream output, byte[] bytes) {
+        output.write(bytes, 0, bytes.length);
     }
 
     /** Encode one signed 64-bit value in network byte order. */

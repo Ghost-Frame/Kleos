@@ -25,15 +25,21 @@ either.
 ## Build
 
 The approval host is a Gradle property. It drives the App Link intent filter
-and the relay pin.
+and the relay pin. No Gradle wrapper is checked in; use Gradle 8.13 or newer
+(required by Android Gradle Plugin 8.13) with JDK 21 and an Android SDK that
+has platform 36.
 
 ```sh
-./gradlew assembleRelease \
+gradle assembleRelease lintDebug \
   -PphylaxApprovalHost=approve.your-domain.example \
   -PphylaxRelayBaseUrl=https://approve.your-domain.example
 ```
 
 Without `phylaxApprovalHost` the app pins `approve.example.com`.
+
+`lintDebug` must report 0 errors. It enforces `minSdk 31`, which is why the
+encoders append bytes with `write(bytes, 0, length)` rather than
+`writeBytes`, an API 33 call that would crash on Android 12.
 
 ## Tests
 

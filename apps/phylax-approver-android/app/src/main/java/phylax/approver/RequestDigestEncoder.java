@@ -36,15 +36,15 @@ public final class RequestDigestEncoder {
             throw new IllegalArgumentException("hidden digest must be 32 bytes");
         }
         ByteArrayOutputStream output = new ByteArrayOutputStream(256);
-        output.writeBytes(DOMAIN);
-        output.writeBytes(longBytes(version));
-        output.writeBytes(longBytes(approvalId));
+        put(output, DOMAIN);
+        put(output, longBytes(version));
+        put(output, longBytes(approvalId));
         appendField(output, agent);
         appendField(output, category);
         appendField(output, target);
         appendField(output, action);
-        output.writeBytes(longBytes(expiresAt));
-        output.writeBytes(hidden);
+        put(output, longBytes(expiresAt));
+        put(output, hidden);
         return output.toByteArray();
     }
 
@@ -76,11 +76,19 @@ public final class RequestDigestEncoder {
         if (bytes.length > MAX_FIELD_BYTES) {
             throw new IllegalArgumentException("display field too long");
         }
-        output.writeBytes(ByteBuffer.allocate(Integer.BYTES)
+        put(output, ByteBuffer.allocate(Integer.BYTES)
                 .order(ByteOrder.BIG_ENDIAN)
                 .putInt(bytes.length)
                 .array());
-        output.writeBytes(bytes);
+        put(output, bytes);
+    }
+
+    /**
+     * Append a whole byte array. ByteArrayOutputStream#writeBytes needs API 33,
+     * and minSdk is 31, so this uses the API 1 three-argument write instead.
+     */
+    private static void put(ByteArrayOutputStream output, byte[] bytes) {
+        output.write(bytes, 0, bytes.length);
     }
 
     /** Encode one signed 64-bit value in network byte order. */
