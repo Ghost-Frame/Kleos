@@ -6,7 +6,7 @@
 
 **Cognitive infrastructure for AI agents. Not a memory engine -- a full operating system for how agents think, learn, coordinate, and stay safe.**
 
-[![License](https://img.shields.io/badge/License-Elastic--2.0-blue.svg)](LICENSE) [![Rust](https://img.shields.io/badge/rust-1.94%2B-orange.svg)](https://www.rust-lang.org) [![Native](https://img.shields.io/badge/Native-No%20Python-blueviolet.svg)](#) [![Discord](https://img.shields.io/discord/1508468167423430757?label=Discord&logo=discord&logoColor=white&color=5865F2)](https://discord.gg/fKyMpE34fm)
+[![License](https://img.shields.io/badge/License-PolyForm%20Noncommercial%201.0.0-blue.svg)](LICENSE) [![Rust](https://img.shields.io/badge/rust-1.94%2B-orange.svg)](https://www.rust-lang.org) [![Native](https://img.shields.io/badge/Native-No%20Python-blueviolet.svg)](#) [![Discord](https://img.shields.io/discord/1508468167423430757?label=Discord&logo=discord&logoColor=white&color=5865F2)](https://discord.gg/fKyMpE34fm)
 
 [Quickstart](https://github.com/Ghost-Frame/Kleos/wiki/Getting-Started) · [Why Kleos](https://github.com/Ghost-Frame/Kleos/wiki/Why-Kleos) · [Wiki](https://github.com/Ghost-Frame/Kleos/wiki) · [Discord](https://discord.gg/fKyMpE34fm)
 

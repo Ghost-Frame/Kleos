@@ -71,7 +71,6 @@ allow = [
     "MPL-2.0",
     "BSL-1.0",
     "0BSD",
-    "Elastic-2.0",
     "PolyForm-Noncommercial-1.0.0",
     "CDLA-Permissive-2.0",
     "OFL-1.1",
