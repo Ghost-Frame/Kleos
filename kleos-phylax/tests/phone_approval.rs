@@ -9,7 +9,7 @@ use kleos_phylax::models::phone_approval::{
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey};
 use p256::pkcs8::EncodePublicKey;
-use rand_core::OsRng;
+use rand_core::{OsRng, RngCore};
 
 /// Displayed-field fixture shared by the digest tests and the Android golden vector.
 fn displayed_fixture() -> DisplayedApproval<'static> {
@@ -32,7 +32,8 @@ fn signed_fixture() -> (PhoneDecisionEnvelope, Vec<u8>, [u8; 32], [u8; 32]) {
         .expect("encode test public key")
         .as_bytes()
         .to_vec();
-    let nonce = [0x31; 32];
+    let mut nonce = [0u8; 32];
+    OsRng.fill_bytes(&mut nonce);
     let hidden = hidden_digest(1, "corr-123", None, 1_786_820_000).unwrap();
     let digest = request_digest(&displayed_fixture(), &hidden).unwrap();
     let mut envelope = PhoneDecisionEnvelope {
@@ -129,8 +130,9 @@ fn changed_decision_is_rejected() {
 /// Rejects a valid signature replayed against a different server nonce.
 #[test]
 fn changed_nonce_is_rejected() {
-    let (envelope, public_key_der, _, digest) = signed_fixture();
-    let different_nonce = [0x99; 32];
+    let (envelope, public_key_der, nonce, digest) = signed_fixture();
+    let mut different_nonce = nonce;
+    different_nonce[0] ^= 0x01;
 
     assert!(verify_envelope(
         &envelope,
