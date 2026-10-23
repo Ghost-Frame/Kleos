@@ -34,6 +34,16 @@ struct AuthenticationSucceeded;
 #[derive(Clone, Copy, Default, Debug)]
 pub struct IsUnixSocket(pub bool);
 
+/// True when the request arrived over the Unix-socket listener.
+///
+/// Fails closed: a request with no [`IsUnixSocket`] marker, or one carrying
+/// `IsUnixSocket(false)`, is treated as TCP.
+pub fn is_unix_origin(extensions: &axum::http::Extensions) -> bool {
+    extensions
+        .get::<IsUnixSocket>()
+        .is_some_and(|marker| marker.0)
+}
+
 /// Hash a socket address IP to an i64 key for the in-memory rate limiter.
 fn ip_to_key(addr: &std::net::IpAddr) -> i64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -157,15 +167,6 @@ impl AuthInfo {
         }
     }
 
-    /// Reports whether this identity may retrieve unredacted secret values.
-    pub fn can_access_raw(&self) -> bool {
-        match self {
-            Self::Master { .. } => true,
-            Self::Agent { key, .. } => key.can_access_raw(),
-            Self::BootstrapAgent { .. } => false,
-        }
-    }
-
     /// True if any of the agent's scopes match `service/key` (exact, wildcard,
     /// or `*`). Only meaningful for `BootstrapAgent`; other variants return
     /// `false`. Master tier should be allowed by callers via `is_master()`
@@ -267,6 +268,28 @@ pub async fn auth_middleware(
         // not, that branch returns UNAUTHORIZED.
         check_bootstrap_agent(token, &state)?
     };
+
+    // Custody profile: the master bearer is only honoured on the Unix socket.
+    // On the TCP listener only agent keys are accepted, so a leaked master
+    // bearer is useless to a network attacker. The audit line names the
+    // request but never the bearer.
+    if state.run_profile.is_custody() && auth.is_master() && !is_unix_origin(request.extensions()) {
+        let peer = request
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|ci| ci.0.ip().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        tracing::warn!(
+            target: "audit",
+            event = "custody.master_bearer_rejected",
+            listener = "tcp",
+            peer = %peer,
+            method = %request.method(),
+            path = %request.uri().path(),
+            "master bearer rejected on TCP listener under custody profile"
+        );
+        return Err(StatusCode::FORBIDDEN);
+    }
 
     request.extensions_mut().insert(auth);
     let mut response = next.run(request).await;

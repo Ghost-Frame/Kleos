@@ -114,10 +114,10 @@ pub async fn resolve_text_handler(
     Json(body): Json<ResolveTextRequest>,
 ) -> Result<Json<ResolveTextResponse>, AppError> {
     // Text substitution returns plaintext secret bytes in the response body,
-    // so it is a plaintext tier and requires the same privilege as raw
-    // retrieval. Non-raw agents (and bootstrap agents) must use proxy
-    // injection, which never returns the secret value to the caller.
-    if !auth.can_access_raw() {
+    // so it is master-only. Agents (and bootstrap agents) must use proxy
+    // injection, which never returns the secret value to the caller. Under
+    // the custody profile this route is not mounted at all.
+    if !auth.is_master() {
         log_audit(
             &state.db,
             auth.user_id(),
@@ -130,7 +130,7 @@ pub async fn resolve_text_handler(
         )
         .await?;
         return Err(CredError::PermissionDenied(
-            "text resolve exposes plaintext and requires raw access; use proxy resolve".into(),
+            "text resolve exposes plaintext and is master-only; use proxy resolve".into(),
         )
         .into());
     }
@@ -498,7 +498,8 @@ pub async fn raw_handler(
     State(state): State<AppState>,
     Json(req): Json<RawRequest>,
 ) -> Result<Json<Value>, AppError> {
-    if !auth.can_access_raw() {
+    // Raw retrieval is master-only; not mounted under the custody profile.
+    if !auth.is_master() {
         log_audit(
             &state.db,
             auth.user_id(),

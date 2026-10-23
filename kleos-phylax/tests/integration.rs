@@ -257,8 +257,7 @@ async fn test_approval_flow() {
             "/agents",
             Some(json!({
                 "name": "test-agent",
-                "categories": ["prod/*"],
-                "allow_raw": false
+                "categories": ["prod/*"]
             })),
         )
         .await;
@@ -358,8 +357,7 @@ async fn test_resolve_raw_denied_for_agents() {
             "/agents",
             Some(json!({
                 "name": "raw-agent",
-                "categories": ["prod/*"],
-                "allow_raw": true
+                "categories": ["prod/*"]
             })),
         )
         .await;
@@ -560,8 +558,7 @@ async fn test_approval_denial() {
             "/agents",
             Some(json!({
                 "name": "deny-agent",
-                "categories": ["prod/*"],
-                "allow_raw": false
+                "categories": ["prod/*"]
             })),
         )
         .await;
@@ -828,8 +825,7 @@ async fn create_agent_token(app: &TestApp, name: &str) -> String {
             "/agents",
             Some(json!({
                 "name": name,
-                "categories": ["ssh-ca/*"],
-                "allow_raw": false
+                "categories": ["ssh-ca/*"]
             })),
         )
         .await;
@@ -1131,8 +1127,7 @@ async fn test_redeem_lease_does_not_return_plaintext_secret() {
             "/agents",
             Some(json!({
                 "name": "redeem-agent",
-                "categories": ["prod/*"],
-                "allow_raw": false
+                "categories": ["prod/*"]
             })),
             &app.master_token,
         )
@@ -2620,8 +2615,7 @@ async fn test_adversarial_agent_cannot_obtain_plaintext_via_any_mode() {
             "/agents",
             Some(json!({
                 "name": "hostile-agent",
-                "categories": ["prod"],
-                "allow_raw": true
+                "categories": ["prod"]
             })),
         )
         .await;

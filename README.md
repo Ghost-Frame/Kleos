@@ -107,7 +107,7 @@ A protocol that controls how agents think, not just what they remember:
 - **Shell command gating** (`kleos-sh`) -- static validation, SSRF guard, metacharacter blocking, Claude Code hook integration
 - **Filesystem sandboxing** (`kleos-fs`) -- AST-aware read/write/edit with configurable allowed roots and path traversal prevention
 - **Agent-marked shells** -- `cred get` blocked in agent contexts to prevent secret exfiltration; agents must use `cred exec` for subprocess injection
-- **Legacy plaintext route is master-only** -- `GET /secret/{category}/{name}` refuses every agent key, including `allow_raw` keys, so agents cannot bypass Phylax policy through it
+- **Legacy plaintext route is master-only** -- `GET /secret/{category}/{name}` refuses every agent key, so agents cannot bypass Phylax policy through it
 - **Exact-phone approvals** (Phylax, opt-in) -- a risky operation can require a biometric signature from one enrolled Android phone. The phone recomputes what it is approving from the fields it displays, signs with a StrongBox-held P-256 key, and the decision is single-use and bound to that exact operation. Enrollment is not implemented yet, so this stays off by default
 - **Audit log on every mutation**
 

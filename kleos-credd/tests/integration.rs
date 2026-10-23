@@ -283,8 +283,7 @@ async fn create_and_list_agent_keys() {
             "/agents",
             json!({
                 "name": "test-agent",
-                "categories": ["openai", "aws"],
-                "allow_raw": false
+                "categories": ["openai", "aws"]
             }),
         )
         .await;
@@ -299,9 +298,8 @@ async fn create_and_list_agent_keys() {
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0]["name"], "test-agent");
 
-    // A non-raw agent (allow_raw:false) is denied the raw /secret get, which
-    // returns plaintext. Raw retrieval requires allow_raw; non-raw agents use
-    // proxy resolve instead. (Previously asserted 200, codifying a plaintext hole.)
+    // An agent is denied the /secret get, which returns plaintext. Plaintext
+    // retrieval is master-only; agents use proxy resolve instead.
     app.post(
         "/secret/openai/key",
         json!({
@@ -329,8 +327,7 @@ async fn agent_key_category_restriction() {
             "/agents",
             json!({
                 "name": "limited-agent",
-                "categories": ["public"],
-                "allow_raw": false
+                "categories": ["public"]
             }),
         )
         .await;
@@ -362,8 +359,7 @@ async fn revoke_agent_key() {
             "/agents",
             json!({
                 "name": "revokable",
-                "categories": ["test"],
-                "allow_raw": false
+                "categories": ["test"]
             }),
         )
         .await;
@@ -395,14 +391,13 @@ async fn revoke_agent_key() {
 async fn non_raw_agent_denied_resolve_text() {
     let app = TestApp::new().await;
 
-    // allow_raw:false agent WITH access to the category.
+    // Agent WITH access to the category.
     let (status, body) = app
         .post(
             "/agents",
             json!({
                 "name": "text-agent",
-                "categories": ["openai"],
-                "allow_raw": false
+                "categories": ["openai"]
             }),
         )
         .await;
@@ -416,7 +411,7 @@ async fn non_raw_agent_denied_resolve_text() {
     .await;
 
     // Text substitution would embed the plaintext in the response body, so a
-    // non-raw agent must be denied and the value must not leak.
+    // agent must be denied and the value must not leak.
     let (status, body) = app
         .request_auth(
             "POST",
@@ -433,11 +428,13 @@ async fn non_raw_agent_denied_resolve_text() {
 }
 
 #[tokio::test]
-/// An allow-raw agent cannot use the legacy plaintext secret route.
+/// An agent sending the retired `allow_raw` flag still cannot use the legacy
+/// plaintext secret route.
 async fn raw_agent_denied_legacy_secret_get() {
     let app = TestApp::new().await;
 
-    // Even allow_raw:true must not bypass Phylax policy through the legacy
+    // A legacy `allow_raw: true` in the request is ignored (the capability no
+    // longer exists) and must not bypass Phylax policy through the legacy
     // plaintext route. Agent-safe operations use the non-plaintext resolve
     // modes instead.
     let (status, body) = app

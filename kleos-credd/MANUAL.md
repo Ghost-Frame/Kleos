@@ -75,7 +75,7 @@ rows are written to `cred_audit`.
 
 `GET /secret/{category}/{name}` returns plaintext and is not covered by
 Phylax resolve policy, so it accepts only the master bearer. Agent keys get
-403 even with `allow_raw`; agents use a non-plaintext resolve mode instead.
+403 (the `allow_raw` capability no longer exists); agents use a non-plaintext resolve mode instead.
 
 `POST /resolve/proxy` denies by default: with no per-category domain
 allowlist configured (`~/.config/cred/proxy-domains.json`), the proxy refuses
@@ -213,6 +213,35 @@ The flow that bootstraps an agent host with zero plaintext on disk:
 The pre-shared `credd-agent-key.token` file is the current weak link in
 this flow. Replacement design (P-256 ECDH via YubiKey PIV applet, slots 9D
 + 9A) is implemented in `kleos-cred/src/piv.rs`.
+
+## Custody profile (phylaxd, `PHYLAX_CUSTODY=1`)
+
+Setting `PHYLAX_CUSTODY=1` (exactly `1`; any other value warns and runs the
+legacy profile) starts the hardened profile:
+
+- Plaintext-returning routes are not mounted at all: `GET /secret/...`,
+  `POST /resolve/text`, `POST /resolve/raw`, `POST /resolve/derive`, and
+  `GET /bootstrap/kleos-bearer` (the ECDH `POST` variant stays).
+- `POST /agents` is reachable only on the Unix socket by the master identity.
+  The request carries an absolute `key_path`; the key is written there with
+  mode 0600 and `O_EXCL`, and the response contains only the name, a
+  fingerprint, and the creation time.
+- The master bearer is refused with 403 on the TCP listener (an audit log line
+  is written, never the bearer); only agent keys are accepted there. The Unix
+  socket keeps its peer-uid rules.
+- The vault key comes from YubiKey slot 1 with the challenge at
+  `/var/lib/phylax/challenge` (override `PHYLAX_CHALLENGE_PATH`). There is no
+  fallback to slot 2; an unprogrammed slot 1 is a startup error.
+- Startup refuses (typed `CustodyStartupError`): running as uid 1000, a vault
+  database not owned by the daemon's euid or not mode 0600 (a missing file is
+  created 0600), and a TCP bind that is not a literal IPv4 inside
+  `10.50.0.0/24`. The Unix socket is forced to mode 0600 with no group,
+  whatever `CREDD_SOCKET_MODE` / `CREDD_SOCKET_GROUP` say.
+
+Agent keys no longer carry an `allow_raw` capability. Old stored permission
+blobs that still contain the key are read and ignored; the permissions are
+stored as JSON in `cred_agent_keys.permissions`, so there is no column to
+migrate.
 
 ## See also
 

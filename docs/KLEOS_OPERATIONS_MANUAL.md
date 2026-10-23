@@ -300,7 +300,7 @@ Supported types:
 
 - Calls `DELETE /secret/{category}/{name}`.
 
-#### `kleos-cli cred agent-create NAME [--categories csv] [--allow-raw]`
+#### `kleos-cli cred agent-create NAME [--categories csv]`
 
 - Calls `POST /agents`.
 - Prints the generated agent key once. It cannot be re-read later.
