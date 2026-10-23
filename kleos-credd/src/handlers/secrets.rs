@@ -138,10 +138,10 @@ pub async fn get_handler(
     State(state): State<AppState>,
     Path((category, name)): Path<(String, String)>,
 ) -> Result<Json<Value>, AppError> {
-    // This endpoint returns the secret plaintext directly (raw tier), so it
-    // requires raw privilege. Non-raw agents must use proxy resolve instead,
-    // which injects the secret server-side without exposing the bytes.
-    if !auth.can_access_raw() {
+    // This legacy endpoint returns the secret plaintext directly and is not
+    // intercepted by Phylax resolve policy. Keep it master-only so an agent
+    // cannot use allow_raw to bypass approval or non-plaintext enforcement.
+    if !auth.is_master() {
         log_audit(
             &state.db,
             auth.user_id(),
@@ -154,7 +154,7 @@ pub async fn get_handler(
         )
         .await?;
         return Err(CredError::PermissionDenied(
-            "raw secret retrieval requires raw access; use proxy resolve".into(),
+            "legacy plaintext retrieval is master-only; use a non-plaintext resolve mode".into(),
         )
         .into());
     }

@@ -24,7 +24,7 @@ use kleos_credd::handlers::AppError;
 
 use crate::audit::{actions, log_phylax_audit};
 use crate::models::approval::{self, ApprovalStatus};
-use crate::state::{PhylaxState, DEFAULT_APPROVAL_TTL_SECS};
+use crate::state::{approval_ttl_secs, PhylaxState};
 
 /// Default ceiling on certificate validity when `KLEOS_SSH_CA_MAX_TTL_SECS` is
 /// unset: 24h. The fleet's operational norm is 12h self-expiring certs, so this
@@ -166,9 +166,10 @@ async fn authorize_or_approve(
     }
 
     let agent_name = auth.agent_name().unwrap_or("unknown").to_string();
-    let expires_at = (chrono::Utc::now() + chrono::Duration::seconds(DEFAULT_APPROVAL_TTL_SECS))
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string();
+    let expires_at = (chrono::Utc::now()
+        + chrono::Duration::seconds(approval_ttl_secs(state.phone_approval_required)))
+    .format("%Y-%m-%d %H:%M:%S")
+    .to_string();
     let (ap, raw_token) = approval::create_approval_with_token(
         &state.inner.db,
         auth.user_id(),
@@ -181,18 +182,31 @@ async fn authorize_or_approve(
     )
     .await?;
 
-    // Best-effort out-of-band push so a human can decide from their phone. No-op
-    // unless PHYLAX_NOTIFY_URL is configured; never blocks or fails the request.
-    crate::notify::notify_approval(
-        ap.id,
-        action,
-        &agent_name,
-        SSH_CA_CATEGORY,
-        secret_name,
-        &expires_at,
-        &raw_token,
-    )
-    .await;
+    if state.phone_approval_required {
+        let binding = approval::bind_phone_approval(&state.inner.db, &ap).await?;
+        crate::notify::notify_phone_approval(
+            ap.id,
+            action,
+            &agent_name,
+            SSH_CA_CATEGORY,
+            secret_name,
+            &expires_at,
+            &raw_token,
+            &binding,
+        )
+        .await;
+    } else {
+        crate::notify::notify_approval(
+            ap.id,
+            action,
+            &agent_name,
+            SSH_CA_CATEGORY,
+            secret_name,
+            &expires_at,
+            &raw_token,
+        )
+        .await;
+    }
 
     // Poll for up to ~110 iterations (< the 120s per-route SSH CA timeout) so a
     // human has time to receive the push and tap before the request is cancelled.
@@ -356,9 +370,11 @@ fn validate_public_key(public_key: &str) -> Result<(), AppError> {
 }
 
 #[cfg(test)]
+/// SSH CA input-validation tests.
 mod tests {
     use super::*;
 
+    /// Common TTL suffixes convert to the expected number of seconds.
     #[test]
     fn ttl_parses_common_intervals() {
         assert_eq!(parse_relative_ttl_secs("+5m"), Some(300));
@@ -368,6 +384,7 @@ mod tests {
         assert_eq!(parse_relative_ttl_secs("+1w"), Some(604_800));
     }
 
+    /// Malformed and zero TTL values are rejected.
     #[test]
     fn ttl_rejects_malformed() {
         assert_eq!(parse_relative_ttl_secs("5m"), None); // no '+'
@@ -378,6 +395,7 @@ mod tests {
         assert_eq!(parse_relative_ttl_secs("+0s"), None); // zero
     }
 
+    /// TTL values above the configured cap are rejected.
     #[test]
     fn ttl_cap_rejects_overlong() {
         // Default cap is 24h; a multi-year request must be rejected.
@@ -385,6 +403,7 @@ mod tests {
         assert!(validate_ttl("+9999w").is_err());
     }
 
+    /// Identity validation rejects traversal and unsafe characters.
     #[test]
     fn identity_rejects_traversal() {
         assert!(validate_identity("agent", "codex-test").is_ok());

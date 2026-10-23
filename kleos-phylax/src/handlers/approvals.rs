@@ -16,7 +16,13 @@ use kleos_credd::handlers::AppError;
 use crate::audit::{actions, log_phylax_audit};
 use crate::models::approval::{self, ApprovalStatus};
 use crate::models::lease;
-use crate::state::{PhylaxState, DEFAULT_APPROVAL_TTL_SECS, DEFAULT_LEASE_TTL_SECS};
+use crate::state::{approval_ttl_secs, PhylaxState, DEFAULT_LEASE_TTL_SECS};
+
+/// Return whether an approved operation resumes by observing approval status
+/// directly instead of redeeming a generic secret-resolution lease.
+fn uses_direct_approval_status(resolve_mode: &str) -> bool {
+    matches!(resolve_mode, "ssh-sign" | "ssh_ca_sign" | "ssh_ca_mint")
+}
 
 /// Request body for creating an approval request.
 #[derive(Deserialize)]
@@ -59,16 +65,17 @@ pub async fn request_approval(
         .agent_name()
         .ok_or_else(|| CredError::PermissionDenied("only agents can request approvals".into()))?;
 
-    let expires_at = (chrono::Utc::now() + chrono::Duration::seconds(DEFAULT_APPROVAL_TTL_SECS))
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string();
+    let expires_at = (chrono::Utc::now()
+        + chrono::Duration::seconds(approval_ttl_secs(state.phone_approval_required)))
+    .format("%Y-%m-%d %H:%M:%S")
+    .to_string();
 
     let correlation_id = body
         .correlation_id
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    let approval = approval::create_approval(
+    let (approval, raw_token) = approval::create_approval_with_token(
         &state.inner.db,
         auth.user_id(),
         agent_name,
@@ -79,6 +86,32 @@ pub async fn request_approval(
         &expires_at,
     )
     .await?;
+
+    if state.phone_approval_required {
+        let binding = approval::bind_phone_approval(&state.inner.db, &approval).await?;
+        crate::notify::notify_phone_approval(
+            approval.id,
+            &body.resolve_mode,
+            agent_name,
+            &body.category,
+            &body.secret_name,
+            &expires_at,
+            &raw_token,
+            &binding,
+        )
+        .await;
+    } else {
+        crate::notify::notify_approval(
+            approval.id,
+            &body.resolve_mode,
+            agent_name,
+            &body.category,
+            &body.secret_name,
+            &expires_at,
+            &raw_token,
+        )
+        .await;
+    }
 
     let _ = log_phylax_audit(
         &state.inner.db,
@@ -159,6 +192,9 @@ pub async fn decide_approval(
 
     // Get the approval first to know the secret details for audit/lease.
     let a = approval::get_approval(&state.inner.db, id).await?;
+    if approval::phone_required(&state.inner.db, id).await? {
+        return Err(CredError::PermissionDenied("enrolled phone signature required".into()).into());
+    }
 
     approval::decide_approval(
         &state.inner.db,
@@ -191,12 +227,14 @@ pub async fn decide_approval(
     )
     .await;
 
-    // If approved, mint a lease -- EXCEPT for ssh-sign approvals.
-    // The sign handler reads Approved status directly and decrypts the key
-    // itself; a redeemable lease for an ssh-sign approval would be a latent
-    // key-exfiltration side channel (any lease holder could redeem it for the
-    // raw private key via the normal resolve path).
-    if decision == ApprovalStatus::Approved && a.resolve_mode != "ssh-sign" {
+    // Direct-status handlers read Approved status themselves. A redeemable
+    // lease for one of those approvals would be a latent secret-resolution
+    // capability unrelated to the requested signing operation.
+    let can_issue_operation_lease = !uses_direct_approval_status(&a.resolve_mode)
+        && approval::get_operation_digest(&state.inner.db, a.id)
+            .await?
+            .is_some();
+    if decision == ApprovalStatus::Approved && can_issue_operation_lease {
         let l = lease::mint_lease(
             &state.inner.db,
             a.user_id,
@@ -233,7 +271,7 @@ pub async fn decide_approval(
         })));
     }
 
-    // For ssh-sign approvals, return approved status without a lease.
+    // Direct-status operations return approved status without a lease.
     if decision == ApprovalStatus::Approved {
         return Ok(Json(json!({ "status": "approved" })));
     }
@@ -257,13 +295,30 @@ pub async fn wait_for_decision(
     loop {
         let a = approval::get_approval(&state.inner.db, id).await?;
 
-        // Verify caller owns this approval.
-        if a.user_id != auth.user_id() && !auth.is_master() {
+        // A bearer for another agent under the same user must not collect the
+        // one-shot lease. Master may inspect status but does not receive the
+        // requesting agent's capability.
+        if !auth.is_master()
+            && (a.user_id != auth.user_id() || auth.agent_name() != Some(a.agent_name.as_str()))
+        {
             return Err(CredError::PermissionDenied("not your approval".into()).into());
         }
 
         if a.status != ApprovalStatus::Pending {
-            return Ok(Json(a.to_json()));
+            let mut response = a.to_json();
+            if a.status == ApprovalStatus::Approved && !auth.is_master() {
+                if let Some(active_lease) = lease::get_active_lease_for_approval(
+                    &state.inner.db,
+                    a.id,
+                    a.user_id,
+                    &a.agent_name,
+                )
+                .await?
+                {
+                    response["lease"] = active_lease.to_json();
+                }
+            }
+            return Ok(Json(response));
         }
 
         if std::time::Instant::now() >= deadline {
@@ -283,8 +338,10 @@ pub async fn wait_for_decision(
 pub struct DecideTokenRequest {
     /// The single-use capability token issued when the approval was raised.
     pub token: String,
-    /// Decision: "approved" or "denied".
-    pub decision: String,
+    /// Legacy Telegram decision: "approved" or "denied".
+    pub decision: Option<String>,
+    /// Exact-phone signed decision envelope.
+    pub phone: Option<crate::models::phone_approval::PhoneDecisionEnvelope>,
 }
 
 /// Decide an approval using a single-use capability token instead of a bearer.
@@ -299,17 +356,105 @@ pub async fn decide_with_token(
     Path(id): Path<i64>,
     Json(body): Json<DecideTokenRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    let approved = match body.decision.as_str() {
-        "approved" => true,
-        "denied" => false,
-        _ => {
-            return Err(
-                CredError::InvalidInput("decision must be 'approved' or 'denied'".into()).into(),
-            )
+    let approval = approval::get_approval(&state.inner.db, id).await?;
+    let phone_device_id = body.phone.as_ref().map(|phone| phone.device_id.as_str());
+    let is_phone_decision = body.phone.is_some();
+    let result = match (body.decision.as_deref(), body.phone.as_ref()) {
+        (None, Some(phone)) => {
+            approval::decide_with_phone(&state.inner.db, id, &body.token, phone).await
         }
+        (Some("approved"), None) => {
+            approval::decide_with_token(&state.inner.db, id, &body.token, true).await
+        }
+        (Some("denied"), None) => {
+            approval::decide_with_token(&state.inner.db, id, &body.token, false).await
+        }
+        _ => Err(CredError::InvalidInput(
+            "provide exactly one valid decision form".into(),
+        )),
     };
-    match approval::decide_with_token(&state.inner.db, id, &body.token, approved).await {
-        Ok(status) => Ok(Json(json!({ "status": status as i32 }))),
-        Err(_) => Err(CredError::PermissionDenied("decision rejected".into()).into()),
+    match result {
+        Ok(status) => {
+            let audit_action = if is_phone_decision {
+                actions::PHONE_APPROVAL_DECIDED
+            } else if status == ApprovalStatus::Approved {
+                actions::APPROVAL_GRANTED
+            } else {
+                actions::APPROVAL_DENIED
+            };
+            let _ = log_phylax_audit(
+                &state.inner.db,
+                approval.user_id,
+                Some(&approval.agent_name),
+                phone_device_id,
+                None,
+                None,
+                None,
+                audit_action,
+                &approval.category,
+                &approval.secret_name,
+                true,
+                approval.correlation_id.as_deref(),
+            )
+            .await;
+
+            let can_issue_operation_lease = !uses_direct_approval_status(&approval.resolve_mode)
+                && approval::get_operation_digest(&state.inner.db, approval.id)
+                    .await?
+                    .is_some();
+            if status == ApprovalStatus::Approved
+                && approval.status == ApprovalStatus::Pending
+                && can_issue_operation_lease
+            {
+                let issued_lease = lease::mint_lease(
+                    &state.inner.db,
+                    approval.user_id,
+                    approval.id,
+                    &approval.agent_name,
+                    &approval.category,
+                    &approval.secret_name,
+                    approval.correlation_id.as_deref(),
+                    DEFAULT_LEASE_TTL_SECS,
+                )
+                .await?;
+                approval::set_approval_lease(&state.inner.db, approval.id, issued_lease.id).await?;
+                let _ = log_phylax_audit(
+                    &state.inner.db,
+                    approval.user_id,
+                    Some(&approval.agent_name),
+                    phone_device_id,
+                    None,
+                    None,
+                    None,
+                    actions::LEASE_MINTED,
+                    &approval.category,
+                    &approval.secret_name,
+                    true,
+                    approval.correlation_id.as_deref(),
+                )
+                .await;
+            }
+            Ok(Json(json!({ "status": status as i32 })))
+        }
+        Err(_) => {
+            if is_phone_decision {
+                let _ = log_phylax_audit(
+                    &state.inner.db,
+                    approval.user_id,
+                    Some(&approval.agent_name),
+                    phone_device_id,
+                    None,
+                    None,
+                    None,
+                    actions::PHONE_APPROVAL_REJECTED,
+                    &approval.category,
+                    &approval.secret_name,
+                    false,
+                    approval.correlation_id.as_deref(),
+                )
+                .await;
+            }
+            Err(CredError::PermissionDenied("decision rejected".into()).into())
+        }
     }
 }
