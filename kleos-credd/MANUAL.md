@@ -68,10 +68,14 @@ Response shape:
 - `POST /resolve/text` -- substitution
 - `POST /resolve/proxy` -- proxy
 - `POST /resolve/raw` -- raw fetch
-- `GET /secret/{category}/{name}` -- DB-backed secret lookup
+- `GET /secret/{category}/{name}` -- legacy plaintext lookup, master only
 
-All require category-permissioned DB-backed agent keys. Audit rows are
-written to `cred_audit`.
+The resolve routes take category-permissioned DB-backed agent keys. Audit
+rows are written to `cred_audit`.
+
+`GET /secret/{category}/{name}` returns plaintext and is not covered by
+Phylax resolve policy, so it accepts only the master bearer. Agent keys get
+403 even with `allow_raw`; agents use a non-plaintext resolve mode instead.
 
 `POST /resolve/proxy` denies by default: with no per-category domain
 allowlist configured (`~/.config/cred/proxy-domains.json`), the proxy refuses
@@ -125,6 +129,8 @@ Unix-socket connections skip the IP-based portion of the rate limiter.
 | `CREDD_AUTH_MODE` | `yubikey` | `yubikey` or `password`. |
 | `CREDD_MASTER_PASSWORD` | unset | Master password (only with `--auth-mode=password`). |
 | `CREDD_SOCKET` | unset (Linux: `/run/user/$UID/credd.sock` if configured) | Unix socket path. |
+| `CREDD_SOCKET_GROUP` | unset | Group allowed to connect to the Unix socket. The socket is chowned to it at bind time. |
+| `CREDD_SOCKET_MODE` | `0600`, or `0660` with a group | Octal socket mode. Owner read/write is required, world bits are rejected, and group bits need `CREDD_SOCKET_GROUP`. |
 | `CREDD_BIND` | unset | TCP bind address (e.g. `127.0.0.1:4400`). |
 | `CREDD_LISTEN` | `127.0.0.1:4400` | Fallback `--listen` value. |
 | `PHYLAXD_URL` | unset | Preferred client-side HTTP endpoint for the Phylax credential authority. |
@@ -145,7 +151,7 @@ value is used as `CREDD_BIND`.
 | `~/.config/cred/bootstrap.enc` | CBv1-sealed Kleos master bearer. Loaded at startup. |
 | `~/.config/cred/agent-keys.json` | File-backed bootstrap-scoped agent tokens. |
 | `~/.config/systemd/user/credd.service` | Linux systemd unit. Restart with `systemctl --user restart credd`. |
-| `$XDG_RUNTIME_DIR/credd.sock` | Default Unix socket path (chmod 0600). |
+| `$XDG_RUNTIME_DIR/credd.sock` | Default Unix socket path (mode 0600, or `CREDD_SOCKET_MODE`). The process umask is tightened only while the socket is created and restored before serving. |
 
 ### Windows specifics
 

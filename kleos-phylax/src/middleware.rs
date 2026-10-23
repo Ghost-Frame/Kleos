@@ -15,13 +15,14 @@ use kleos_cred::agent_keys::parse_agent_key;
 use kleos_cred::agent_keys::validate_agent_key;
 use kleos_cred::crypto::hash_key;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use kleos_credd::auth::AuthInfo;
 
 use crate::audit::{actions, log_phylax_audit};
-use crate::models::{approval, policy};
-use crate::state::{PhylaxState, DEFAULT_APPROVAL_TTL_SECS};
+use crate::models::{approval, lease, policy};
+use crate::state::{approval_ttl_secs, PhylaxState};
 
 /// Paths that are subject to policy-check interception.
 const RESOLVE_PATHS: &[&str] = &[
@@ -34,6 +35,22 @@ const RESOLVE_PATHS: &[&str] = &[
     "/resolve/derive",
 ];
 
+/// Header carrying the one-shot lease that resumes an approved operation.
+const PHYLAX_LEASE_HEADER: &str = "x-phylax-lease";
+
+/// Hash the exact method, path, and body that one approval may resume.
+fn operation_digest(method: &str, path: &str, body: &[u8]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"phylax-approved-operation-v1\0");
+    digest.update((method.len() as u64).to_be_bytes());
+    digest.update(method.as_bytes());
+    digest.update((path.len() as u64).to_be_bytes());
+    digest.update(path.as_bytes());
+    digest.update((body.len() as u64).to_be_bytes());
+    digest.update(body);
+    digest.finalize().into()
+}
+
 /// Policy-check middleware. Runs after auth but before credd's resolve handlers.
 ///
 /// If the request targets a resolve endpoint and a matching policy requires
@@ -45,6 +62,10 @@ pub async fn policy_check_middleware(
     next: Next,
 ) -> Response {
     let path = request.uri().path().to_string();
+    let operation_target = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| path.clone(), ToString::to_string);
 
     // Only intercept resolve endpoints.
     if !RESOLVE_PATHS.iter().any(|p| path == *p) {
@@ -166,6 +187,67 @@ pub async fn policy_check_middleware(
                 .into_response();
         }
     };
+    let bound_operation = operation_digest(parts.method.as_str(), &operation_target, &body_bytes);
+
+    // A successful approval authorizes exactly one matching retry. Consume
+    // the lease before the operation reaches its handler so replay, a changed
+    // agent, secret, or resolve mode all fail closed.
+    if let Some(jti) = parts
+        .headers
+        .get(PHYLAX_LEASE_HEADER)
+        .and_then(|value| value.to_str().ok())
+    {
+        let redeemed = lease::redeem_lease_for_operation(
+            &state.inner.db,
+            jti,
+            auth.user_id(),
+            &agent_name,
+            &category,
+            &secret_name,
+            resolve_mode,
+            &bound_operation,
+        )
+        .await;
+        if redeemed.is_err() {
+            let _ = log_phylax_audit(
+                &state.inner.db,
+                auth.user_id(),
+                Some(&agent_name),
+                None,
+                None,
+                None,
+                None,
+                actions::LEASE_REPLAY,
+                &category,
+                &secret_name,
+                false,
+                None,
+            )
+            .await;
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "approval lease rejected"})),
+            )
+                .into_response();
+        }
+        let _ = log_phylax_audit(
+            &state.inner.db,
+            auth.user_id(),
+            Some(&agent_name),
+            None,
+            None,
+            None,
+            None,
+            actions::LEASE_REDEEMED,
+            &category,
+            &secret_name,
+            true,
+            None,
+        )
+        .await;
+        let request = Request::from_parts(parts, Body::from(body_bytes));
+        return next.run(request).await;
+    }
 
     // Check for a matching policy. Use the "default" namespace for now.
     let namespace = "default";
@@ -296,11 +378,12 @@ pub async fn policy_check_middleware(
 
     // Create an approval request.
     let correlation_id = uuid::Uuid::new_v4().to_string();
-    let expires_at = (chrono::Utc::now() + chrono::Duration::seconds(DEFAULT_APPROVAL_TTL_SECS))
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string();
+    let expires_at = (chrono::Utc::now()
+        + chrono::Duration::seconds(approval_ttl_secs(state.phone_approval_required)))
+    .format("%Y-%m-%d %H:%M:%S")
+    .to_string();
 
-    let approval_result = approval::create_approval(
+    let approval_result = approval::create_approval_with_token(
         &state.inner.db,
         auth.user_id(),
         &agent_name,
@@ -313,7 +396,52 @@ pub async fn policy_check_middleware(
     .await;
 
     match approval_result {
-        Ok(a) => {
+        Ok((a, raw_token)) => {
+            if let Err(error) =
+                approval::set_operation_digest(&state.inner.db, a.id, &bound_operation).await
+            {
+                tracing::error!(%error, "failed to bind exact approval operation");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "failed to bind approval operation"})),
+                )
+                    .into_response();
+            }
+            if state.phone_approval_required {
+                let binding = match approval::bind_phone_approval(&state.inner.db, &a).await {
+                    Ok(binding) => binding,
+                    Err(error) => {
+                        tracing::error!(%error, "failed to bind exact-phone approval");
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({"error": "failed to bind approval"})),
+                        )
+                            .into_response();
+                    }
+                };
+                crate::notify::notify_phone_approval(
+                    a.id,
+                    resolve_mode,
+                    &agent_name,
+                    &category,
+                    &secret_name,
+                    &expires_at,
+                    &raw_token,
+                    &binding,
+                )
+                .await;
+            } else {
+                crate::notify::notify_approval(
+                    a.id,
+                    resolve_mode,
+                    &agent_name,
+                    &category,
+                    &secret_name,
+                    &expires_at,
+                    &raw_token,
+                )
+                .await;
+            }
             let _ = log_phylax_audit(
                 &state.inner.db,
                 auth.user_id(),

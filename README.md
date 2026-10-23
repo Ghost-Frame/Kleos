@@ -107,6 +107,8 @@ A protocol that controls how agents think, not just what they remember:
 - **Shell command gating** (`kleos-sh`) -- static validation, SSRF guard, metacharacter blocking, Claude Code hook integration
 - **Filesystem sandboxing** (`kleos-fs`) -- AST-aware read/write/edit with configurable allowed roots and path traversal prevention
 - **Agent-marked shells** -- `cred get` blocked in agent contexts to prevent secret exfiltration; agents must use `cred exec` for subprocess injection
+- **Legacy plaintext route is master-only** -- `GET /secret/{category}/{name}` refuses every agent key, including `allow_raw` keys, so agents cannot bypass Phylax policy through it
+- **Exact-phone approvals** (Phylax, opt-in) -- a risky operation can require a biometric signature from one enrolled Android phone. The phone recomputes what it is approving from the fields it displays, signs with a StrongBox-held P-256 key, and the decision is single-use and bound to that exact operation. Enrollment is not implemented yet, so this stays off by default
 - **Audit log on every mutation**
 
 ### Real-time supervision
@@ -400,11 +402,13 @@ Four channels run per query:
 | `kleos-sidecar` | Session-scoped memory proxy. Batched flushing and hook-driven local code-context retrieval. |
 | `kleos-cred` | Credential library. YubiKey challenge-response, Argon2id KDF, ECDH agreement, CRED:v3 vault resolution. |
 | `kleos-credd` | Base credential daemon. Two-tier auth (master + agent keys), AES-256-GCM encryption, zero-knowledge agent bootstrap. |
-| `kleos-phylax` | Agent-native credential authority library: approvals, leases, ECDH, namespaces. |
+| `kleos-phylax` | Agent-native credential authority library: approvals, operation-bound leases, exact-phone signed decisions, ECDH, namespaces. |
 | `kleos-phylaxd` (`phylaxd`) | Composes `kleos-credd`'s base router with Phylax agent-native security policy enforcement; behaves as plain `credd` with no policies set. Not yet part of releases or the installer -- `kleos-credd` is the credential daemon that actually ships as the `credd` service. |
 | `kleos-phylax-ssh-agent` | OpenSSH agent protocol server: wire protocol and KeyProvider trait. |
 | `kleos-phylax-ssh-agentd` | Headless SSH agent daemon that brokers keys and signing through phylaxd. |
 | `kleos-token-client` | Tiny std-only client for the phylaxd SO_PEERCRED token broker (no kleos-lib dependency). |
+| `apps/phylax-approval-relay` | Standalone relay for exact-phone approvals. Takes authenticated notifications from phylaxd on a private network, serves pickup links behind TLS ingress, and never returns the decision capability to a client. Not a workspace member. |
+| `apps/phylax-approver-android` | Android approver app. Shows the pending operation, checks its digest, and signs approve or deny with a biometric-gated StrongBox key. |
 | `kleos-ingest` | Transcript ingest daemon. PIV/software-key request signing, file watching, LLM summarization, real-time observation streaming. |
 | `agent-forge` | Structured reasoning CLI. 20+ subcommands. Tree-sitter AST parsing for 7 languages. |
 | `forge` | agent-forge compute engine as a library (repo-map, code search, comment-check, challenge-code), used server-side by kleos-server. |
