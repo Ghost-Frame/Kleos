@@ -32,8 +32,7 @@ fn signed_fixture() -> (PhoneDecisionEnvelope, Vec<u8>, [u8; 32], [u8; 32]) {
         .expect("encode test public key")
         .as_bytes()
         .to_vec();
-    let mut nonce = [0u8; 32];
-    OsRng.fill_bytes(&mut nonce);
+    let nonce: [u8; 32] = std::array::from_fn(|_| OsRng.next_u32().to_le_bytes()[0]);
     let hidden = hidden_digest(1, "corr-123", None, 1_786_820_000).unwrap();
     let digest = request_digest(&displayed_fixture(), &hidden).unwrap();
     let mut envelope = PhoneDecisionEnvelope {
