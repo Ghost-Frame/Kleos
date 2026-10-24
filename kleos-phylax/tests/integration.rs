@@ -529,8 +529,9 @@ async fn test_agent_resolve_fails_closed_on_policy_error() {
             "POST",
             "/resolve/proxy",
             Some(json!({
-                "category": "prod",
-                "name": "db-pass"
+                "url": "https://api.example.com/",
+                "secret_category": "prod",
+                "secret_name": "db-pass"
             })),
             &agent_key,
         )
@@ -2739,4 +2740,147 @@ async fn maintenance_phylax_valid_calls_preserve_failure_budget() {
             .count(),
         10
     );
+}
+
+// ---- Sealed proxy: policy extraction and ordering ----
+
+/// SQL counting approval rows.
+const COUNT_APPROVALS_SQL: &str = "SELECT COUNT(*) FROM phylax_approvals";
+
+/// Count rows in the approvals table.
+async fn approval_count(app: &TestApp) -> i64 {
+    let read = app.db.read(|conn| {
+        let n: i64 = conn.query_row(COUNT_APPROVALS_SQL, [], |r| r.get(0))?;
+        Ok(n)
+    });
+    read.await.expect("count approvals")
+}
+
+/// Send a POST with an optional bearer, returning only the status.
+async fn status_for(app: &TestApp, path: &str, token: Option<&str>, body: Value) -> StatusCode {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json");
+    if let Some(token) = token {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    let req = builder
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    app.router.clone().oneshot(req).await.unwrap().status()
+}
+
+/// A proxy body that smuggles a decoy `category`/`name` pair next to the real
+/// `secret_category`/`secret_name` is refused outright. Before this, policy was
+/// evaluated on the decoy pair while the handler used the real one.
+#[tokio::test]
+async fn test_proxy_decoy_fields_cannot_steer_policy() {
+    let app = TestApp::new().await;
+    let agent_key = setup_mode_fixture(&app, "decoy-agent", json!(["proxy"]), true).await;
+
+    // A harmless category with a no-approval policy: the decoy target.
+    let (status, _) = app
+        .request_master(
+            "POST",
+            "/phylax/policies",
+            Some(json!({
+                "namespace": "default",
+                "category": "harmless",
+                "require_approval": false,
+                "allowed_modes": ["proxy"]
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The honest request is held for approval by the prod policy.
+    let (status, body) = app
+        .request_auth(
+            "POST",
+            "/resolve/proxy",
+            Some(json!({
+                "url": "https://api.example.com/",
+                "secret_category": "prod",
+                "secret_name": "db-pass"
+            })),
+            &agent_key,
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let approvals_before = approval_count(&app).await;
+
+    // The decoy request is a hard error, not a pass-through and not a policy
+    // decision on the decoy pair.
+    let (status, body) = app
+        .request_auth(
+            "POST",
+            "/resolve/proxy",
+            Some(json!({
+                "url": "https://api.example.com/",
+                "secret_category": "prod",
+                "secret_name": "db-pass",
+                "category": "harmless",
+                "name": "anything"
+            })),
+            &agent_key,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        !serde_json::to_string(&body)
+            .unwrap()
+            .contains("super-secret"),
+        "decoy rejection must not leak the secret"
+    );
+    assert_eq!(
+        approval_count(&app).await,
+        approvals_before,
+        "a rejected decoy must not create approvals"
+    );
+
+    // A body with only the decoy pair (no real reference) is rejected too.
+    let (status, _) = app
+        .request_auth(
+            "POST",
+            "/resolve/proxy",
+            Some(json!({
+                "url": "https://api.example.com/",
+                "category": "harmless",
+                "name": "anything"
+            })),
+            &agent_key,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// An unauthenticated resolve request gets 401 and never reaches policy: no
+/// approval is created even though a matching approval-required policy exists.
+#[tokio::test]
+async fn test_unauthenticated_resolve_is_401_before_policy() {
+    let app = TestApp::new().await;
+    let _agent_key = setup_mode_fixture(&app, "order-agent", json!(["proxy"]), true).await;
+    let before = approval_count(&app).await;
+
+    let body = json!({
+        "url": "https://api.example.com/",
+        "secret_category": "prod",
+        "secret_name": "db-pass"
+    });
+    for token in [None, Some("not-a-real-token")] {
+        let status = status_for(&app, "/resolve/proxy", token, body.clone()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "token {token:?}");
+    }
+    // A body that would be a policy denial for an authenticated agent is still
+    // a plain 401 for an anonymous caller.
+    let exec_body = json!({
+        "category": "prod",
+        "name": "db-pass",
+        "argv": ["/bin/x"],
+        "env_var": "S"
+    });
+    let status = status_for(&app, "/resolve/exec", None, exec_body).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(approval_count(&app).await, before);
 }

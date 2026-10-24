@@ -119,10 +119,21 @@ pub fn phylax_route_table(profile: RunProfile) -> RouteTable<PhylaxState> {
 }
 
 /// Build the Phylax extension routes. These are merged into the credd
-/// router by the phylaxd binary. The mounted set follows `state.run_profile`.
-pub fn phylax_routes(state: AppState) -> Router<PhylaxState> {
+/// router by the phylaxd binary. The mounted set follows
+/// `phylax_state.run_profile`.
+///
+/// Layer order, outermost first: preauth rate limit, auth, body limit, trace,
+/// then `policy_check_middleware` closest to the handlers. Policy therefore
+/// sees only authenticated requests; an unauthenticated one is answered 401
+/// before any policy decision.
+pub fn phylax_routes(phylax_state: &PhylaxState) -> Router<PhylaxState> {
+    let state = phylax_state.inner.clone();
     phylax_route_table(state.run_profile)
         .into_router()
+        .route_layer(middleware::from_fn_with_state(
+            phylax_state.clone(),
+            policy_check_middleware,
+        ))
         // Apply the same auth and preauth protections to all routes.
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -143,10 +154,11 @@ pub fn mounted_paths(profile: RunProfile) -> Vec<String> {
 
 /// Compose credd base routes and phylax extensions into a single router.
 ///
-/// The returned app keeps credd middleware semantics, then inserts
-/// `policy_check_middleware` so /resolve/* requests can return approval
-/// responses before credd plaintext handlers execute. The mounted route set
-/// follows the `run_profile` carried by `state`.
+/// `policy_check_middleware` is installed on both route sets inside their
+/// authentication layer, so /resolve/* requests can return approval responses
+/// before credd plaintext handlers execute, but only after the caller has been
+/// authenticated. The mounted route set follows the `run_profile` carried by
+/// `state`.
 pub fn compose_router(state: AppState) -> Router {
     compose_router_with_phylax_state(PhylaxState::from_app_state(state))
 }
@@ -154,14 +166,18 @@ pub fn compose_router(state: AppState) -> Router {
 /// Compose credd base routes and Phylax extensions with an explicit Phylax state.
 pub fn compose_router_with_phylax_state(phylax_state: PhylaxState) -> Router {
     let state = phylax_state.inner.clone();
-    // Merge credd base routes with phylax extension routes and enforce policy
-    // interception on all resolve endpoints before the plaintext resolve handlers run.
-    let app = kleos_credd::credd_routes::<PhylaxState>(state.clone())
-        .merge(phylax_routes(state))
-        .route_layer(middleware::from_fn_with_state(
-            phylax_state.clone(),
+    // Merge credd base routes with phylax extension routes. Each set carries
+    // the policy layer between its auth layers and its handlers, so policy
+    // interception on resolve endpoints runs after authentication.
+    let policy_phylax_state = phylax_state.clone();
+    let with_policy = move |router: Router<PhylaxState>| {
+        router.route_layer(middleware::from_fn_with_state(
+            policy_phylax_state,
             policy_check_middleware,
-        ));
+        ))
+    };
+    let app = kleos_credd::credd_routes_with_inner_layer::<PhylaxState>(state, with_policy)
+        .merge(phylax_routes(&phylax_state));
 
     app.with_state(phylax_state)
 }

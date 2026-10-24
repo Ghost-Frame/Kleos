@@ -62,6 +62,11 @@ pub struct AppState {
     /// Run profile the daemon was started with. Decides which routes are
     /// mounted and whether the master bearer is accepted over TCP.
     pub run_profile: RunProfile,
+    /// Test seam: when true the proxy skips the SSRF check for loopback IP
+    /// literals so integration tests can use a local upstream. Always false
+    /// outside code that calls [`AppState::with_loopback_proxy_for_tests`];
+    /// it is never read from the environment or a config file.
+    pub proxy_allow_loopback: bool,
 }
 
 impl AppState {
@@ -78,12 +83,22 @@ impl AppState {
             kleos_signer: None,
             proxy_domain_allowlist: load_proxy_domain_allowlist(),
             run_profile: RunProfile::Legacy,
+            proxy_allow_loopback: false,
         }
     }
 
     /// Return this state with `profile` installed as the run profile.
     pub fn with_run_profile(mut self, profile: RunProfile) -> Self {
         self.run_profile = profile;
+        self
+    }
+
+    /// Return this state with the proxy SSRF loopback exemption enabled.
+    ///
+    /// Test-only seam: lets an integration test point the proxy at a
+    /// `127.0.0.1` upstream. Production code must never call this.
+    pub fn with_loopback_proxy_for_tests(mut self) -> Self {
+        self.proxy_allow_loopback = true;
         self
     }
 
@@ -109,6 +124,7 @@ impl AppState {
             kleos_signer,
             proxy_domain_allowlist: load_proxy_domain_allowlist(),
             run_profile: RunProfile::Legacy,
+            proxy_allow_loopback: false,
         }
     }
 }
@@ -120,13 +136,14 @@ impl AppState {
 /// ```
 /// The wildcard category `"*"` matches any category. Domain entries support
 /// leading `*.` prefix for subdomain matching. Returns None if the file does
-/// not exist; with no allowlist the proxy denies by default (F09) unless
-/// `CREDD_PROXY_ALLOW_ANY=1` is set to opt back into forwarding to any host.
+/// not exist; with no allowlist the legacy-profile proxy denies every request
+/// (F09). The custody profile ignores this file and uses each secret's
+/// `allowed_origins` instead.
 fn load_proxy_domain_allowlist() -> Option<Arc<ProxyDomainAllowlist>> {
     let path = cred_config_dir().join("proxy-domains.json");
     if !path.exists() {
         tracing::info!(
-            "no proxy domain allowlist at {}; proxy denies by default (set CREDD_PROXY_ALLOW_ANY=1 to allow any host)",
+            "no proxy domain allowlist at {}; the legacy-profile proxy denies by default",
             path.display()
         );
         return None;

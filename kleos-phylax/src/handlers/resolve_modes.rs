@@ -39,6 +39,7 @@ const ALGO_ED25519: &str = "ed25519";
 
 /// Body for POST /resolve/sign.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SignModeRequest {
     /// Secret category.
     pub category: String,
@@ -52,6 +53,7 @@ pub struct SignModeRequest {
 
 /// Body for POST /resolve/verify.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerifyModeRequest {
     /// Secret category.
     pub category: String,
@@ -67,6 +69,7 @@ pub struct VerifyModeRequest {
 
 /// Body for POST /resolve/derive.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeriveModeRequest {
     /// Secret category.
     pub category: String,
@@ -311,6 +314,7 @@ const EXEC_OUTPUT_CAP: usize = 256 * 1024;
 
 /// Body for POST /resolve/exec.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecModeRequest {
     /// Secret category.
     pub category: String,

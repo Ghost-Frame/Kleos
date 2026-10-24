@@ -77,13 +77,51 @@ rows are written to `cred_audit`.
 Phylax resolve policy, so it accepts only the master bearer. Agent keys get
 403 (the `allow_raw` capability no longer exists); agents use a non-plaintext resolve mode instead.
 
-`POST /resolve/proxy` denies by default: with no per-category domain
-allowlist configured (`~/.config/cred/proxy-domains.json`), the proxy refuses
-to forward credentials to any host. Configure an allowlist, or set
-`CREDD_PROXY_ALLOW_ANY=1` to forward to any host. This is opt-in and does not
-affect normal credential resolution or first-time setup.
+`POST /resolve/proxy` denies by default and has no environment opt-out.
 
-Allowlist notes: domain patterns are matched case-insensitively (the target
+Per-secret proxy settings (`proxy_policy`) are accepted by
+`POST`/`PUT /secret/{category}/{name}` next to `data` and stored inside the
+encrypted secret blob:
+
+```json
+{
+  "data": {"type": "api_key", "key": "..."},
+  "proxy_policy": {
+    "allowed_origins": [{"scheme": "https", "host": "api.example.com", "port": 443}],
+    "extra_auth_headers": ["X-Custom-Token"],
+    "drop_response_body": false
+  }
+}
+```
+
+- `allowed_origins`: exact `(scheme, host, port)` triples, port mandatory. A
+  wildcard (`*`, `*.example.com`), empty host, port 0 or a scheme other than
+  http/https is rejected at store time (400). Hosts are lowercased.
+- `extra_auth_headers`: header names the secret may be injected into besides
+  `Authorization` and `X-Api-Key` (case-insensitive). Framing and hop-by-hop
+  headers (`Host`, `Content-Length`, `Set-Cookie`, ...) are rejected.
+- `drop_response_body`: return status and non-sensitive headers with an empty
+  body and `content-length: 0`.
+- On `PUT`, omitting `proxy_policy` keeps the stored one; sending `{}` clears
+  it. Rows written before this field existed load with an empty policy.
+
+Both profiles: `auth_header` must be `Authorization`, `X-Api-Key` or one of
+the secret's extras (400 otherwise); the request carries
+`Accept-Encoding: identity`; the upstream response is scanned for the secret
+(raw, hex, base64 at all alignments, percent, JSON escapes) and every match is
+replaced with `[REDACTED]`, headers value by value and the body streamed. A
+response with a content-encoding the proxy cannot decode is refused.
+
+Custody profile (`PHYLAX_CUSTODY=1`): the target `(scheme, host, effective
+port)` must equal one of the secret's `allowed_origins`, else 403 before any
+DNS lookup or connection; the domain allowlist file below is not consulted.
+Secrets shorter than 3 bytes are refused (400).
+
+Legacy profile: the per-category domain allowlist below still applies. With
+no allowlist configured (`~/.config/cred/proxy-domains.json`) the proxy
+refuses to forward credentials to any host.
+
+Allowlist notes (legacy profile): domain patterns are matched case-insensitively (the target
 host and the configured patterns are both lowercased), so casing in the JSON
 does not matter. Supported forms are exact (`api.github.com`), subdomain
 wildcard (`*.amazonaws.com`, which matches the suffix and any subdomain), and

@@ -4,7 +4,8 @@
 //! content format: `[CRED:v3] {category}/{name} = {hex(nonce || ciphertext)}`.
 
 use kleos_cred::crypto::{decrypt, encrypt, KEY_SIZE};
-use kleos_cred::types::SecretData;
+use kleos_cred::crypto::{open_secret_plaintext, seal_secret_plaintext};
+use kleos_cred::types::{ProxyPolicy, SecretData};
 use reqwest::Client;
 use serde::Deserialize;
 use tracing::{debug, warn};
@@ -132,9 +133,10 @@ pub(crate) async fn store_to_kleos(
     category: &str,
     name: &str,
     data: &SecretData,
+    policy: &ProxyPolicy,
     master_key: &[u8; KEY_SIZE],
 ) {
-    if let Err(e) = store_to_kleos_inner(state, category, name, data, master_key).await {
+    if let Err(e) = store_to_kleos_inner(state, category, name, data, policy, master_key).await {
         warn!(category, name, error = %e, "failed to sync store to Kleos v3");
     }
 }
@@ -154,6 +156,7 @@ async fn store_to_kleos_inner(
     category: &str,
     name: &str,
     data: &SecretData,
+    policy: &ProxyPolicy,
     master_key: &[u8; KEY_SIZE],
 ) -> Result<(), String> {
     // Reject category/name that would corrupt the V3 content format on re-parse.
@@ -167,7 +170,7 @@ async fn store_to_kleos_inner(
     // Delete existing entry first
     delete_from_kleos_inner(state, category, name).await.ok();
 
-    let plaintext = serde_json::to_vec(data).map_err(|e| format!("serialize: {}", e))?;
+    let plaintext = seal_secret_plaintext(data, policy).map_err(|e| format!("serialize: {}", e))?;
     let ciphertext = encrypt(master_key, &plaintext).map_err(|e| format!("encrypt: {}", e))?;
     let hex_data = hex::encode(&ciphertext);
     let content = format!("{}{}/{} = {}", V3_PREFIX, category, name, hex_data);
@@ -252,12 +255,13 @@ async fn delete_from_kleos_inner(
     Ok(())
 }
 
-/// Decrypt a v3 hex blob into SecretData.
+/// Decrypt a v3 hex blob into the secret and its proxy policy (default for
+/// entries written before policies existed).
 pub(crate) fn decrypt_v3_entry(
     hex_data: &str,
     master_key: &[u8; KEY_SIZE],
-) -> Result<SecretData, String> {
+) -> Result<(SecretData, ProxyPolicy), String> {
     let ciphertext = hex::decode(hex_data).map_err(|e| format!("hex decode: {}", e))?;
     let plaintext = decrypt(master_key, &ciphertext).map_err(|e| format!("decrypt: {}", e))?;
-    serde_json::from_slice(&plaintext).map_err(|e| format!("json parse: {}", e))
+    open_secret_plaintext(&plaintext).map_err(|e| format!("json parse: {}", e))
 }
