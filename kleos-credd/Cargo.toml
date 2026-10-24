@@ -27,7 +27,10 @@ tower-http.workspace = true
 tokio.workspace = true
 
 # HTTP client for proxy; futures for streaming the capped proxy body.
-reqwest.workspace = true
+# The `native-tls` feature (already in the dependency graph via default-tls) is
+# what exposes `Identity::from_pkcs8_pem`, used to present x509 bundles as the
+# TLS client identity.
+reqwest = { workspace = true, features = ["native-tls"] }
 futures.workspace = true
 
 # Serialization
@@ -62,6 +65,11 @@ hkdf = "0.12"
 aes-gcm = "0.10"
 sha2 = { workspace = true }
 
+# X.509 leaf issuance for `rotate-leaf`: certificate types, DER and PEM codecs
+# (pure Rust, already in the lockfile) plus SHA-1 for RFC 5280 key identifiers.
+x509-cert = "0.2.5"
+sha1 = "0.10"
+
 [dev-dependencies]
 proptest = "1"
 tokio = { workspace = true, features = ["test-util", "macros"] }
@@ -70,3 +78,6 @@ http-body-util = "0.1"
 tower = { workspace = true, features = ["util"] }
 hex = "0.4"
 tempfile = { workspace = true }
+# TLS upstream that demands a client certificate, for the mTLS proxy tests.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

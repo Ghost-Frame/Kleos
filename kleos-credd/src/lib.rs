@@ -12,6 +12,8 @@ pub mod redact;
 pub mod routes;
 pub mod server;
 pub mod state;
+/// X.509 issuance and verification helpers behind `rotate-leaf`.
+pub mod x509;
 
 use axum::{
     extract::{DefaultBodyLimit, FromRef},
@@ -73,6 +75,9 @@ where
         .post("/resolve/text", LegacyOnly, resolve::resolve_text_handler)
         .post("/resolve/proxy", Always, resolve::proxy_handler)
         .post("/resolve/raw", LegacyOnly, resolve::raw_handler)
+        // Public half of a bundle or ssh key (certificate, chain, public
+        // key); never the private key, so it is safe under both profiles.
+        .post("/resolve/public", Always, handlers::x509::public_handler)
         // Agent key management. Creation returns the raw key in the legacy
         // profile; custody swaps in a handler that writes the key to a 0600
         // file and returns only a fingerprint.
@@ -93,6 +98,13 @@ where
             "/bootstrap/kleos-bearer",
             Always,
             bootstrap_bearer::post_bootstrap_kleos_bearer_ecdh,
+        )
+        // Rotate an X.509 client leaf under a CA held in the vault; only the
+        // new certificate is returned, never a key.
+        .post(
+            "/custody/x509/rotate-leaf",
+            CustodyOnly,
+            handlers::x509::rotate_leaf,
         )
         // Health check (no auth)
         .get("/health", Always, health_handler)

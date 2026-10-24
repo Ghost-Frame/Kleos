@@ -179,6 +179,7 @@ fn credd_route_enumeration_matches_profile() {
     for route in [
         "GET /secrets",
         "POST /resolve/proxy",
+        "POST /resolve/public",
         "POST /agents",
         "GET /health",
     ] {
@@ -186,7 +187,18 @@ fn credd_route_enumeration_matches_profile() {
             custody.iter().any(|r| r == route),
             "{route} missing in custody"
         );
+        assert!(
+            legacy.iter().any(|r| r == route),
+            "{route} missing in legacy"
+        );
     }
+    // Custody-only: mounted under custody, absent under legacy.
+    let rotate = "POST /custody/x509/rotate-leaf";
+    assert!(
+        custody.iter().any(|r| r == rotate),
+        "{rotate} missing in custody"
+    );
+    assert!(!legacy.iter().any(|r| r == rotate), "{rotate} under legacy");
 }
 
 /// Custody: the master bearer works on the Unix socket and is refused with 403

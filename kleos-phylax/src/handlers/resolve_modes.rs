@@ -107,6 +107,15 @@ async fn load_secret(
 /// Environment secrets hold many values and are rejected: there is no single
 /// "the secret" to key with.
 fn secret_key_bytes(data: SecretData) -> Result<Zeroizing<Vec<u8>>, AppError> {
+    // A legacy bundle is stored as a note, so the match below would take its
+    // base64 JSON (private key included) as keying material. Anything that is
+    // or looks like an x509 bundle is refused first.
+    if !matches!(data.as_x509_bundle(), Ok(None)) {
+        return Err(CredError::InvalidInput(
+            "x509 bundles cannot be used as a keying secret".into(),
+        )
+        .into());
+    }
     let bytes = match data {
         SecretData::Note { content } => content.into_bytes(),
         SecretData::ApiKey { key, .. } => key.into_bytes(),
@@ -116,6 +125,14 @@ fn secret_key_bytes(data: SecretData) -> Result<Zeroizing<Vec<u8>>, AppError> {
         SecretData::Environment { .. } => {
             return Err(CredError::InvalidInput(
                 "environment secrets have no single key value".into(),
+            )
+            .into())
+        }
+        // A TLS identity is presented by the proxy, not used to key MACs or
+        // KDFs; refusing here keeps the private key out of those code paths.
+        SecretData::X509Bundle { .. } => {
+            return Err(CredError::InvalidInput(
+                "x509 bundles cannot be used as a keying secret".into(),
             )
             .into())
         }

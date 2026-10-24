@@ -9,6 +9,7 @@ pub use super::types::{
 };
 
 use axum::{extract::State, Json};
+use base64::Engine;
 use serde_json::{json, Value};
 
 use kleos_cred::audit::{log_audit, AccessTier, AuditAction};
@@ -438,7 +439,21 @@ pub async fn proxy_handler(
         .into());
     }
 
-    let secret_value = data.primary_value();
+    // An x509 bundle (typed, or the legacy base64-JSON note) is presented as
+    // the TLS client identity of the outbound connection and never as a header,
+    // so a caller-chosen header or scheme makes no sense and is refused.
+    let bundle = data.as_x509_bundle()?;
+    if bundle.is_some() && (req.auth_header.is_some() || req.auth_scheme.is_some()) {
+        return Err(CredError::InvalidInput(
+            "x509 bundles are presented as the TLS client identity, not as a header".into(),
+        )
+        .into());
+    }
+
+    let secret_value = match &bundle {
+        Some(material) => material.private_key_pem.clone(),
+        None => data.primary_value(),
+    };
     if custody && secret_value.len() < MIN_SECRET_LEN {
         return Err(CredError::InvalidInput(
             "secret is too short to proxy safely (response redaction needs 3+ bytes)".into(),
@@ -455,47 +470,80 @@ pub async fn proxy_handler(
 
     // SECURITY: the secret may only be injected into an allowlisted header, so
     // a caller cannot aim it at a header the upstream echoes or logs verbatim.
+    // A bundle injects nothing, so there is no header to validate for it.
     let header_name = req
         .auth_header
         .clone()
         .unwrap_or_else(|| "Authorization".to_string());
-    if !policy.auth_header_allowed(&header_name) {
-        return Err(CredError::InvalidInput(format!(
-            "auth_header '{}' is not allowed for this secret",
-            header_name
-        ))
-        .into());
-    }
-    let header_value = match req.auth_scheme.as_deref() {
-        Some("") => secret_value.clone(),
-        Some(scheme) => format!("{} {}", scheme.trim(), secret_value),
-        None => format!("Bearer {}", secret_value),
-    };
-
-    // Everything the upstream could echo back: the injected header value, the
-    // bare secret, and the secret without surrounding whitespace.
-    // Values under 3 bytes cannot be redacted safely; custody already refused
-    // such a secret above, and the legacy profile still redacts the longer
-    // header value that wraps it.
     let mut secrets: Vec<Vec<u8>> = Vec::new();
-    for candidate in [
-        header_value.as_str(),
-        secret_value.as_str(),
-        secret_value.trim(),
-    ] {
-        if candidate.len() >= MIN_SECRET_LEN && !secrets.iter().any(|s| s == candidate.as_bytes()) {
-            secrets.push(candidate.as_bytes().to_vec());
-        }
-    }
+    let injected: Option<(reqwest::header::HeaderName, reqwest::header::HeaderValue)> =
+        if let Some(material) = &bundle {
+            // The upstream never receives the key over TLS, but a hostile or
+            // buggy one could still echo a copy it obtained elsewhere: redact
+            // the PEM as stored, trimmed, its unwrapped base64 body, and the
+            // DER bytes that body decodes to. Certificates are public and are
+            // not redacted.
+            let mut candidates: Vec<Vec<u8>> = vec![
+                material.private_key_pem.as_bytes().to_vec(),
+                material.private_key_pem.trim().as_bytes().to_vec(),
+            ];
+            if let Some(body) = kleos_cred::types::unwrap_pem_body(&material.private_key_pem) {
+                if let Ok(der) = base64::engine::general_purpose::STANDARD.decode(body.as_bytes()) {
+                    candidates.push(der);
+                }
+                candidates.push(body.into_bytes());
+            }
+            for candidate in candidates {
+                if candidate.len() >= MIN_SECRET_LEN && !secrets.contains(&candidate) {
+                    secrets.push(candidate);
+                }
+            }
+            None
+        } else {
+            if !policy.auth_header_allowed(&header_name) {
+                return Err(CredError::InvalidInput(format!(
+                    "auth_header '{}' is not allowed for this secret",
+                    header_name
+                ))
+                .into());
+            }
+            let header_value = match req.auth_scheme.as_deref() {
+                Some("") => secret_value.clone(),
+                Some(scheme) => format!("{} {}", scheme.trim(), secret_value),
+                None => format!("Bearer {}", secret_value),
+            };
+
+            // Everything the upstream could echo back: the injected header
+            // value, the bare secret, and the secret without surrounding
+            // whitespace. Values under 3 bytes cannot be redacted safely;
+            // custody already refused such a secret above, and the legacy
+            // profile still redacts the longer header value that wraps it.
+            for candidate in [
+                header_value.as_str(),
+                secret_value.as_str(),
+                secret_value.trim(),
+            ] {
+                if candidate.len() >= MIN_SECRET_LEN
+                    && !secrets.iter().any(|s| s == candidate.as_bytes())
+                {
+                    secrets.push(candidate.as_bytes().to_vec());
+                }
+            }
+
+            let name =
+                reqwest::header::HeaderName::from_bytes(header_name.as_bytes()).map_err(|_| {
+                    CredError::InvalidInput("auth_header is not a valid header name".into())
+                })?;
+            let mut value =
+                reqwest::header::HeaderValue::from_str(&header_value).map_err(|_| {
+                    CredError::InvalidInput("secret cannot be sent as a header value".into())
+                })?;
+            value.set_sensitive(true);
+            Some((name, value))
+        };
     let redactor = Redactor::new(&secrets)
         .map_err(|e| CredError::InvalidInput(format!("cannot build response redactor: {}", e)))?;
     drop(secrets);
-
-    let injected_name = reqwest::header::HeaderName::from_bytes(header_name.as_bytes())
-        .map_err(|_| CredError::InvalidInput("auth_header is not a valid header name".into()))?;
-    let mut injected_value = reqwest::header::HeaderValue::from_str(&header_value)
-        .map_err(|_| CredError::InvalidInput("secret cannot be sent as a header value".into()))?;
-    injected_value.set_sensitive(true);
 
     // SECURITY (SSRF-DNS): SSRF validation -- reject requests targeting
     // loopback, private, link-local, and cloud metadata addresses. Resolves
@@ -527,6 +575,37 @@ pub async fn proxy_handler(
             client_builder.resolve(&target.host, std::net::SocketAddr::new(ip, target.port));
     }
 
+    // The bundle is the client identity for this connection. `from_pkcs8_pem`
+    // belongs to the native-tls backend, so that backend is selected explicitly
+    // (other workspace members also compile reqwest's rustls backend). Errors
+    // from the identity parse are replaced by a fixed message so no key bytes
+    // can be echoed through them.
+    if let Some(material) = &bundle {
+        let mut chain = material.certificate_pem.trim_start().to_string();
+        if let Some(extra) = &material.chain_pem {
+            if !chain.ends_with('\n') {
+                chain.push('\n');
+            }
+            chain.push_str(extra);
+        }
+        let identity = reqwest::Identity::from_pkcs8_pem(
+            chain.as_bytes(),
+            material.private_key_pem.trim().as_bytes(),
+        )
+        .map_err(|_| {
+            CredError::InvalidInput("x509 bundle is not a usable TLS client identity".into())
+        })?;
+        client_builder = client_builder.use_native_tls().identity(identity);
+    }
+
+    // Test seam: trust one extra root so a throwaway-CA upstream is reachable
+    // with verification fully on. Always `None` outside tests.
+    if let Some(root_pem) = &state.proxy_extra_root_ca {
+        let root = reqwest::Certificate::from_pem(root_pem)
+            .map_err(|_| CredError::InvalidInput("extra root CA is not valid PEM".into()))?;
+        client_builder = client_builder.add_root_certificate(root);
+    }
+
     let client = client_builder
         .build()
         .map_err(|e| CredError::InvalidInput(format!("client build failed: {}", e)))?;
@@ -540,7 +619,7 @@ pub async fn proxy_handler(
     if let Some(headers) = &req.headers {
         for (name, value) in headers {
             if is_stripped_request_header(name)
-                || name.eq_ignore_ascii_case(&header_name)
+                || (injected.is_some() && name.eq_ignore_ascii_case(&header_name))
                 || name.eq_ignore_ascii_case("accept-encoding")
             {
                 continue;
@@ -550,7 +629,9 @@ pub async fn proxy_handler(
     }
     // SECURITY: ask for an unencoded response so the redactor sees plaintext.
     builder = builder.header(reqwest::header::ACCEPT_ENCODING, "identity");
-    builder = builder.header(injected_name, injected_value);
+    if let Some((injected_name, injected_value)) = injected {
+        builder = builder.header(injected_name, injected_value);
+    }
 
     if let Some(body) = &req.body {
         builder = builder.body(body.clone());

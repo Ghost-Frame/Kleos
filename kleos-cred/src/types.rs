@@ -2,7 +2,10 @@
 
 use std::collections::HashMap;
 
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::{CredError, Result};
 
@@ -16,6 +19,8 @@ pub enum SecretType {
     SshKey,
     Note,
     Environment,
+    /// An X.509 certificate with its private key (and optional chain).
+    X509Bundle,
 }
 
 impl SecretType {
@@ -27,6 +32,7 @@ impl SecretType {
             Self::SshKey => "ssh_key",
             Self::Note => "note",
             Self::Environment => "environment",
+            Self::X509Bundle => "x509_bundle",
         }
     }
 
@@ -38,6 +44,7 @@ impl SecretType {
             "ssh_key" => Some(Self::SshKey),
             "note" => Some(Self::Note),
             "environment" => Some(Self::Environment),
+            "x509_bundle" => Some(Self::X509Bundle),
             _ => None,
         }
     }
@@ -93,6 +100,112 @@ pub enum SecretData {
     Environment {
         variables: HashMap<String, String>,
     },
+    /// An X.509 certificate with its private key, presented by the credential
+    /// proxy as a TLS client identity and never returned to callers.
+    X509Bundle {
+        /// PEM certificate (the leaf, public material).
+        certificate_pem: String,
+        /// PKCS#8 PEM private key for `certificate_pem` (secret).
+        private_key_pem: String,
+        /// Optional PEM intermediate chain (public material).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        chain_pem: Option<String>,
+    },
+}
+
+/// Schema version accepted for the legacy base64-JSON bundle carried in a
+/// [`SecretData::Note`].
+pub const LEGACY_BUNDLE_SCHEMA_VERSION: u64 = 1;
+
+/// The parts of an X.509 bundle, whichever storage shape they came from.
+///
+/// Returned by [`SecretData::as_x509_bundle`]. Debug is hand-implemented so the
+/// private key can never reach a log line.
+#[derive(Clone, PartialEq, Eq)]
+pub struct X509Material {
+    /// PEM certificate (the leaf, public material).
+    pub certificate_pem: String,
+    /// PKCS#8 PEM private key (secret).
+    pub private_key_pem: String,
+    /// Optional PEM intermediate chain (public material).
+    pub chain_pem: Option<String>,
+}
+
+/// Redacted debug output: lengths only, never PEM text.
+impl std::fmt::Debug for X509Material {
+    /// Print byte lengths and a redaction marker for the key.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("X509Material")
+            .field("certificate_pem", &self.certificate_pem.len())
+            .field("private_key_pem", &"[REDACTED]")
+            .field("chain_pem", &self.chain_pem.as_ref().map(String::len))
+            .finish()
+    }
+}
+
+/// On-the-wire shape of the legacy bundle: base64 (standard, padded) of this
+/// JSON object stored as the `content` of a note.
+#[derive(Deserialize)]
+struct LegacyBundle {
+    /// Format version; only [`LEGACY_BUNDLE_SCHEMA_VERSION`] is accepted.
+    #[serde(default)]
+    schema_version: Option<serde_json::Value>,
+    /// PEM certificate.
+    certificate_pem: String,
+    /// PKCS#8 PEM private key.
+    private_key_pem: String,
+}
+
+/// Decode a note's content as a legacy bundle.
+///
+/// `Ok(None)` when the content is not base64 of a JSON object carrying both PEM
+/// fields (an ordinary note). `Err(InvalidInput)` when it is such a bundle but
+/// its `schema_version` is not [`LEGACY_BUNDLE_SCHEMA_VERSION`].
+fn decode_legacy_bundle(content: &str) -> Result<Option<X509Material>> {
+    let Ok(raw) = STANDARD.decode(content.trim()) else {
+        return Ok(None);
+    };
+    let raw = Zeroizing::new(raw);
+    let Ok(bundle) = serde_json::from_slice::<LegacyBundle>(&raw) else {
+        return Ok(None);
+    };
+    let version = bundle
+        .schema_version
+        .as_ref()
+        .and_then(serde_json::Value::as_u64);
+    if version != Some(LEGACY_BUNDLE_SCHEMA_VERSION) {
+        return Err(CredError::InvalidInput(format!(
+            "unsupported x509 bundle schema_version (expected {LEGACY_BUNDLE_SCHEMA_VERSION})"
+        )));
+    }
+    Ok(Some(X509Material {
+        certificate_pem: bundle.certificate_pem,
+        private_key_pem: bundle.private_key_pem,
+        chain_pem: None,
+    }))
+}
+
+/// The base64 body of the first PEM block in `pem`, with line breaks and
+/// surrounding whitespace removed.
+///
+/// Used to build redaction needles: a response can echo the key without its
+/// armor lines or its line wrapping. Returns `None` when `pem` holds no
+/// complete `BEGIN`/`END` block or the block is empty. RFC 1421 header lines
+/// (those containing `:`) are skipped.
+pub fn unwrap_pem_body(pem: &str) -> Option<String> {
+    let mut body = String::new();
+    let mut inside = false;
+    for line in pem.lines() {
+        let line = line.trim();
+        if !inside {
+            inside = line.starts_with("-----BEGIN ") && line.ends_with("-----");
+        } else if line.starts_with("-----END ") {
+            return (!body.is_empty()).then_some(body);
+        } else if !line.contains(':') {
+            body.extend(line.chars().filter(|c| !c.is_whitespace()));
+        }
+    }
+    None
 }
 
 impl std::fmt::Debug for SecretData {
@@ -112,6 +225,7 @@ impl SecretData {
             Self::SshKey { .. } => SecretType::SshKey,
             Self::Note { .. } => SecretType::Note,
             Self::Environment { .. } => SecretType::Environment,
+            Self::X509Bundle { .. } => SecretType::X509Bundle,
         }
     }
 
@@ -124,6 +238,7 @@ impl SecretData {
     /// - SshKey: private_key
     /// - Note: content
     /// - Environment: JSON of all variables
+    /// - X509Bundle: private_key_pem
     pub fn primary_value(&self) -> String {
         match self {
             Self::Login { password, .. } => password.clone(),
@@ -132,6 +247,33 @@ impl SecretData {
             Self::SshKey { private_key, .. } => private_key.clone(),
             Self::Note { content } => content.clone(),
             Self::Environment { variables } => serde_json::to_string(variables).unwrap_or_default(),
+            Self::X509Bundle {
+                private_key_pem, ..
+            } => private_key_pem.clone(),
+        }
+    }
+
+    /// The certificate, key and chain of this secret when it is an X.509 bundle.
+    ///
+    /// Accepts a real [`SecretData::X509Bundle`] and a legacy
+    /// [`SecretData::Note`] whose content is base64 of
+    /// `{"schema_version":1,"certificate_pem":..,"private_key_pem":..}`.
+    /// Every other secret, and a note that is not such a bundle, yields
+    /// `Ok(None)`. A legacy bundle with any other `schema_version` is an
+    /// `InvalidInput` error rather than silently treated as an ordinary note.
+    pub fn as_x509_bundle(&self) -> Result<Option<X509Material>> {
+        match self {
+            Self::X509Bundle {
+                certificate_pem,
+                private_key_pem,
+                chain_pem,
+            } => Ok(Some(X509Material {
+                certificate_pem: certificate_pem.clone(),
+                private_key_pem: private_key_pem.clone(),
+                chain_pem: chain_pem.clone(),
+            })),
+            Self::Note { content } => decode_legacy_bundle(content),
+            _ => Ok(None),
         }
     }
 
@@ -189,6 +331,16 @@ impl SecretData {
                 _ => None,
             },
             Self::Environment { variables } => variables.get(field).cloned(),
+            Self::X509Bundle {
+                certificate_pem,
+                private_key_pem,
+                chain_pem,
+            } => match field {
+                "certificate_pem" => Some(certificate_pem.clone()),
+                "private_key_pem" => Some(private_key_pem.clone()),
+                "chain_pem" => chain_pem.clone(),
+                _ => None,
+            },
         }
     }
 
@@ -201,6 +353,7 @@ impl SecretData {
             Self::SshKey { .. } => "SshKey",
             Self::Note { .. } => "Note",
             Self::Environment { .. } => "Environment",
+            Self::X509Bundle { .. } => "X509Bundle",
         }
     }
 
@@ -277,6 +430,13 @@ impl SecretData {
             }
             Self::Note { .. } => vec!["content".to_string()],
             Self::Environment { variables } => variables.keys().cloned().collect(),
+            Self::X509Bundle { chain_pem, .. } => {
+                let mut f = vec!["certificate_pem".to_string(), "private_key_pem".to_string()];
+                if chain_pem.is_some() {
+                    f.push("chain_pem".to_string());
+                }
+                f
+            }
         }
     }
 
@@ -314,6 +474,7 @@ impl SecretData {
                 let names: Vec<_> = variables.keys().map(|k| format!("{}=***", k)).collect();
                 names.join(", ")
             }
+            Self::X509Bundle { .. } => "[x509 certificate and private key]".to_string(),
         }
     }
 }
@@ -563,6 +724,7 @@ mod tests {
             SecretType::SshKey,
             SecretType::Note,
             SecretType::Environment,
+            SecretType::X509Bundle,
         ] {
             assert_eq!(SecretType::parse(st.as_str()), Some(st));
         }
@@ -849,5 +1011,162 @@ mod tests {
         let unknown: std::result::Result<ProxyPolicy, _> =
             serde_json::from_str(r#"{"allowed_origin":[]}"#);
         assert!(unknown.is_err(), "typos must not be silently ignored");
+    }
+
+    /// Fake but well-formed PEM armor around a short base64 body.
+    const FAKE_KEY_PEM: &str =
+        "-----BEGIN PRIVATE KEY-----\nQUJDREVG\nR0hJSktM\n-----END PRIVATE KEY-----\n";
+
+    /// Fake certificate PEM.
+    const FAKE_CERT_PEM: &str =
+        "-----BEGIN CERTIFICATE-----\nQ0VSVA==\n-----END CERTIFICATE-----\n";
+
+    /// Legacy note content: base64 of the schema-versioned JSON bundle.
+    fn legacy_content(schema_version: u64) -> String {
+        let json = serde_json::json!({
+            "schema_version": schema_version,
+            "certificate_pem": FAKE_CERT_PEM,
+            "private_key_pem": FAKE_KEY_PEM,
+        });
+        STANDARD.encode(json.to_string())
+    }
+
+    /// The x509 bundle variant serializes with the snake_case tag and omits an
+    /// absent chain.
+    #[test]
+    fn x509_bundle_serialization_and_fields() {
+        let bundle = SecretData::X509Bundle {
+            certificate_pem: FAKE_CERT_PEM.into(),
+            private_key_pem: FAKE_KEY_PEM.into(),
+            chain_pem: None,
+        };
+        let json = serde_json::to_string(&bundle).unwrap();
+        assert!(json.contains("\"type\":\"x509_bundle\""));
+        assert!(!json.contains("chain_pem"));
+        let restored: SecretData = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.secret_type(), SecretType::X509Bundle);
+        assert_eq!(bundle.primary_value(), FAKE_KEY_PEM);
+        assert_eq!(
+            bundle.get_field("certificate_pem"),
+            Some(FAKE_CERT_PEM.to_string())
+        );
+        assert_eq!(
+            bundle.get_field("private_key_pem"),
+            Some(FAKE_KEY_PEM.to_string())
+        );
+        assert_eq!(bundle.get_field("chain_pem"), None);
+        assert_eq!(
+            bundle.field_names(),
+            vec!["certificate_pem", "private_key_pem"]
+        );
+        assert_eq!(bundle.bare_value(), None);
+        let dbg = format!("{bundle:?}");
+        assert!(!dbg.contains("BEGIN"), "Debug must not print PEM: {dbg}");
+        assert!(!bundle.redacted_preview().contains("QUJD"));
+    }
+
+    /// A real bundle yields its parts, chain included.
+    #[test]
+    fn as_x509_bundle_returns_real_bundle_parts() {
+        let bundle = SecretData::X509Bundle {
+            certificate_pem: FAKE_CERT_PEM.into(),
+            private_key_pem: FAKE_KEY_PEM.into(),
+            chain_pem: Some("CHAIN".into()),
+        };
+        let material = bundle.as_x509_bundle().unwrap().expect("bundle");
+        assert_eq!(material.certificate_pem, FAKE_CERT_PEM);
+        assert_eq!(material.private_key_pem, FAKE_KEY_PEM);
+        assert_eq!(material.chain_pem.as_deref(), Some("CHAIN"));
+        let dbg = format!("{material:?}");
+        assert!(!dbg.contains("BEGIN") && !dbg.contains("QUJD"), "{dbg}");
+    }
+
+    /// A schema-1 legacy note decodes to its certificate and key.
+    #[test]
+    fn as_x509_bundle_decodes_legacy_note() {
+        let note = SecretData::Note {
+            content: legacy_content(1),
+        };
+        let material = note.as_x509_bundle().unwrap().expect("legacy bundle");
+        assert_eq!(material.certificate_pem, FAKE_CERT_PEM);
+        assert_eq!(material.private_key_pem, FAKE_KEY_PEM);
+        assert_eq!(material.chain_pem, None);
+        let padded_with_newline = SecretData::Note {
+            content: format!("{}\n", legacy_content(1)),
+        };
+        assert!(padded_with_newline.as_x509_bundle().unwrap().is_some());
+    }
+
+    /// Any other schema version is rejected loudly, not treated as a note.
+    #[test]
+    fn as_x509_bundle_rejects_other_schema_versions() {
+        for version in [0u64, 2, 99] {
+            let note = SecretData::Note {
+                content: legacy_content(version),
+            };
+            assert!(
+                matches!(note.as_x509_bundle(), Err(CredError::InvalidInput(_))),
+                "schema_version {version} must be rejected"
+            );
+        }
+        let missing = serde_json::json!({
+            "certificate_pem": FAKE_CERT_PEM,
+            "private_key_pem": FAKE_KEY_PEM,
+        });
+        let note = SecretData::Note {
+            content: STANDARD.encode(missing.to_string()),
+        };
+        assert!(matches!(
+            note.as_x509_bundle(),
+            Err(CredError::InvalidInput(_))
+        ));
+    }
+
+    /// Ordinary notes and non-bundle secrets are not bundles.
+    #[test]
+    fn as_x509_bundle_ignores_everything_else() {
+        let cases: Vec<String> = vec![
+            "just a note".to_string(),
+            String::new(),
+            "e30=".to_string(),
+            STANDARD.encode(r#"{"hello":"world"}"#),
+            STANDARD.encode("not json at all"),
+        ];
+        for content in cases {
+            let note = SecretData::Note {
+                content: content.clone(),
+            };
+            assert!(note.as_x509_bundle().unwrap().is_none(), "{content:?}");
+        }
+        let api = SecretData::ApiKey {
+            key: "k".into(),
+            endpoint: None,
+            notes: None,
+        };
+        assert!(api.as_x509_bundle().unwrap().is_none());
+    }
+
+    /// The PEM body is the base64 text without armor, line breaks or spaces.
+    #[test]
+    fn unwrap_pem_body_strips_armor_and_whitespace() {
+        assert_eq!(
+            unwrap_pem_body(FAKE_KEY_PEM).as_deref(),
+            Some("QUJDREVGR0hJSktM")
+        );
+        assert_eq!(
+            unwrap_pem_body("-----BEGIN X-----\r\n AB CD \r\nEF\r\n-----END X-----").as_deref(),
+            Some("ABCDEF")
+        );
+        assert_eq!(
+            unwrap_pem_body("-----BEGIN X-----\nProc-Type: 4,ENCRYPTED\nQUJD\n-----END X-----\n")
+                .as_deref(),
+            Some("QUJD")
+        );
+        assert_eq!(unwrap_pem_body("no armor here"), None);
+        assert_eq!(unwrap_pem_body("-----BEGIN X-----\nQUJD\n"), None);
+        assert_eq!(
+            unwrap_pem_body("-----BEGIN X-----\n-----END X-----\n"),
+            None
+        );
     }
 }

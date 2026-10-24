@@ -1,7 +1,7 @@
 //! Engram credential management with encrypted storage and YubiKey support.
 //!
 //! This crate provides:
-//! - Structured secret types (Login, ApiKey, OAuthApp, SshKey, Note, Environment)
+//! - Structured secret types (Login, ApiKey, OAuthApp, SshKey, Note, Environment, X509Bundle)
 //! - AES-256-GCM encryption for secrets at rest
 //! - YubiKey HMAC-SHA1 challenge-response for key derivation
 //! - Agent keys with permission scoping and revocation

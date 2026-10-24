@@ -6,6 +6,9 @@
 //! other data), because a base64 encoder emits different characters for the
 //! same bytes depending on the offset modulo 3.
 
+/// Throwaway PKI fixtures (CA, client and server certificates) for x509 tests.
+pub mod x509_fixtures;
+
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine;
 

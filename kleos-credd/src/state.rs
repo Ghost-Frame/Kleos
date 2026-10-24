@@ -67,6 +67,12 @@ pub struct AppState {
     /// outside code that calls [`AppState::with_loopback_proxy_for_tests`];
     /// it is never read from the environment or a config file.
     pub proxy_allow_loopback: bool,
+    /// Test seam: PEM of one extra root CA the proxy's outbound HTTPS client
+    /// trusts, so an integration test can reach a TLS upstream signed by a
+    /// throwaway CA without ever disabling certificate verification. `None`
+    /// outside code that calls [`AppState::with_extra_root_ca_for_tests`]; it
+    /// is never read from the environment or a config file.
+    pub proxy_extra_root_ca: Option<Arc<Vec<u8>>>,
 }
 
 impl AppState {
@@ -84,6 +90,7 @@ impl AppState {
             proxy_domain_allowlist: load_proxy_domain_allowlist(),
             run_profile: RunProfile::Legacy,
             proxy_allow_loopback: false,
+            proxy_extra_root_ca: None,
         }
     }
 
@@ -99,6 +106,16 @@ impl AppState {
     /// `127.0.0.1` upstream. Production code must never call this.
     pub fn with_loopback_proxy_for_tests(mut self) -> Self {
         self.proxy_allow_loopback = true;
+        self
+    }
+
+    /// Return this state with `pem` added to the roots the proxy trusts.
+    ///
+    /// Test-only seam: lets an integration test run an mTLS upstream whose
+    /// certificate chains to a throwaway CA. Production code must never call
+    /// this.
+    pub fn with_extra_root_ca_for_tests(mut self, pem: Vec<u8>) -> Self {
+        self.proxy_extra_root_ca = Some(Arc::new(pem));
         self
     }
 
@@ -125,6 +142,7 @@ impl AppState {
             proxy_domain_allowlist: load_proxy_domain_allowlist(),
             run_profile: RunProfile::Legacy,
             proxy_allow_loopback: false,
+            proxy_extra_root_ca: None,
         }
     }
 }
