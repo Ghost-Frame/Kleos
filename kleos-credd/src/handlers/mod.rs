@@ -12,9 +12,9 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
 
-use kleos_cred::crypto::decrypt;
+use kleos_cred::crypto::{decrypt, open_secret_plaintext};
 use kleos_cred::storage::SecretRow;
-use kleos_cred::types::SecretData;
+use kleos_cred::types::{ProxyPolicy, SecretData};
 use kleos_cred::CredError;
 
 use crate::state::AppState;
@@ -87,13 +87,23 @@ struct KleosMemoryRow {
     content: String,
 }
 
-/// Resolve a secret from Kleos [CRED:v3] entries.
-/// Fallback for when the local SQLCipher database does not have the entry.
+/// Resolve a secret from Kleos [CRED:v3] entries, discarding its proxy policy.
 pub async fn resolve_from_kleos(
     state: &AppState,
     category: &str,
     name: &str,
 ) -> Result<(SecretRow, SecretData), AppError> {
+    let (row, data, _policy) = resolve_from_kleos_with_policy(state, category, name).await?;
+    Ok((row, data))
+}
+
+/// Resolve a secret and its proxy policy from Kleos [CRED:v3] entries.
+/// Fallback for when the local SQLCipher database does not have the entry.
+pub async fn resolve_from_kleos_with_policy(
+    state: &AppState,
+    category: &str,
+    name: &str,
+) -> Result<(SecretRow, SecretData, ProxyPolicy), AppError> {
     // Reject category/name that could corrupt the V3 content-format match: the
     // target_prefix below is built from these and matched with starts_with, so
     // a `/` in category or ` = ` in name could shadow or skip a different entry
@@ -221,7 +231,7 @@ pub async fn resolve_from_kleos(
         CredError::Decryption("corrupt cred entry: decrypt failed".into())
     })?;
 
-    let data: SecretData = serde_json::from_slice(&plaintext).map_err(|e| {
+    let (data, policy) = open_secret_plaintext(&plaintext).map_err(|e| {
         tracing::error!("JSON parse failed for {}/{}: {}", category, name, e);
         CredError::InvalidInput("corrupt cred entry: JSON parse failed".into())
     })?;
@@ -236,7 +246,7 @@ pub async fn resolve_from_kleos(
         updated_at: String::new(),
     };
 
-    Ok((row, data))
+    Ok((row, data, policy))
 }
 
 /// Get a secret, trying local DB first, then falling back to Kleos [CRED:v3].
@@ -246,9 +256,22 @@ pub async fn get_secret_with_fallback(
     category: &str,
     name: &str,
 ) -> Result<(SecretRow, SecretData), AppError> {
-    use kleos_cred::storage::get_secret;
+    let (row, data, _policy) =
+        get_secret_and_policy_with_fallback(state, user_id, category, name).await?;
+    Ok((row, data))
+}
 
-    match get_secret(
+/// Like [`get_secret_with_fallback`], but also returns the secret's proxy
+/// policy (default for v3 entries and rows that predate policies).
+pub async fn get_secret_and_policy_with_fallback(
+    state: &AppState,
+    user_id: i64,
+    category: &str,
+    name: &str,
+) -> Result<(SecretRow, SecretData, ProxyPolicy), AppError> {
+    use kleos_cred::storage::get_secret_with_policy;
+
+    match get_secret_with_policy(
         &state.db,
         user_id,
         category,
@@ -260,7 +283,7 @@ pub async fn get_secret_with_fallback(
         Ok(result) => Ok(result),
         Err(CredError::NotFound(_)) => {
             tracing::debug!("{}/{} not in local DB, trying Kleos vault", category, name);
-            resolve_from_kleos(state, category, name).await
+            resolve_from_kleos_with_policy(state, category, name).await
         }
         Err(e) => Err(e.into()),
     }

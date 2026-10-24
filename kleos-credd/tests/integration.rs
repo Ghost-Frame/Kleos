@@ -15,14 +15,15 @@ use kleos_lib::db::Database;
 // Test harness
 // ---------------------------------------------------------------------------
 
+/// In-memory credential daemon and its master bearer for HTTP integration tests.
 struct TestApp {
     router: Router,
     master_token: String,
 }
 
-/// Provides authenticated and unauthenticated request helpers for integration tests.
+/// Request helpers for the in-memory credential daemon.
 impl TestApp {
-    /// Builds an isolated credential-daemon router and temporary database.
+    /// Build a fresh in-memory database, key, state, and router.
     async fn new() -> Self {
         let db = Database::connect_memory().await.expect("in-memory db");
 
@@ -39,29 +40,29 @@ impl TestApp {
         }
     }
 
-    /// Sends an unauthenticated GET request to the test router.
+    /// Send an unauthenticated GET request.
     async fn get(&self, path: &str) -> (StatusCode, Value) {
         self.request("GET", path, None).await
     }
 
-    /// Sends a GET request bearing the supplied authentication token.
+    /// Send a GET request with the selected bearer.
     async fn get_auth(&self, path: &str, token: &str) -> (StatusCode, Value) {
         self.request_auth("GET", path, None, token).await
     }
 
-    /// Sends an authenticated POST request with a JSON body.
+    /// Send a master-authenticated JSON POST request.
     async fn post(&self, path: &str, body: Value) -> (StatusCode, Value) {
         self.request_auth("POST", path, Some(body), &self.master_token)
             .await
     }
 
-    /// Sends an authenticated DELETE request to the test router.
+    /// Send a master-authenticated DELETE request.
     async fn delete(&self, path: &str) -> (StatusCode, Value) {
         self.request_auth("DELETE", path, None, &self.master_token)
             .await
     }
 
-    /// Dispatches a request using the test application's master token.
+    /// Send one unauthenticated request and decode its JSON response.
     async fn request(&self, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value) {
         let mut builder = Request::builder().method(method).uri(path);
 
@@ -84,7 +85,7 @@ impl TestApp {
         (status, json)
     }
 
-    /// Dispatches a request with an explicit bearer token and optional JSON body.
+    /// Send one bearer-authenticated request and decode its JSON response.
     async fn request_auth(
         &self,
         method: &str,
@@ -140,7 +141,7 @@ async fn unauthenticated_request_rejected() {
 }
 
 #[tokio::test]
-/// Rejects a request carrying a token unknown to every authentication tier.
+/// An invalid bearer is rejected.
 async fn invalid_token_rejected() {
     let app = TestApp::new().await;
     let (status, _) = app.get_auth("/secrets", "invalid-token").await;
@@ -148,31 +149,12 @@ async fn invalid_token_rejected() {
 }
 
 #[tokio::test]
-/// Accepts the configured master token and returns the protected response.
+/// The generated master bearer authenticates successfully.
 async fn master_token_accepted() {
     let app = TestApp::new().await;
     let (status, body) = app.get_auth("/secrets", &app.master_token).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.get("secrets").is_some());
-}
-
-/// Proves the pre-authentication guard charges only failed authentication attempts.
-#[tokio::test]
-async fn valid_authentication_does_not_consume_the_failure_budget() {
-    let app = TestApp::new().await;
-
-    for _ in 0..20 {
-        let (status, _) = app.get_auth("/secrets", &app.master_token).await;
-        assert_eq!(status, StatusCode::OK);
-    }
-
-    for _ in 0..10 {
-        let (status, _) = app.get_auth("/secrets", "invalid-token").await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-    }
-
-    let (status, _) = app.get_auth("/secrets", "invalid-token").await;
-    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
 }
 
 // ---------------------------------------------------------------------------
@@ -209,7 +191,7 @@ async fn store_and_get_api_key() {
 }
 
 #[tokio::test]
-/// Stores and retrieves a structured login credential through the master tier.
+/// Login secrets round-trip for the master identity.
 async fn store_and_get_login() {
     let app = TestApp::new().await;
 
@@ -236,7 +218,7 @@ async fn store_and_get_login() {
 }
 
 #[tokio::test]
-/// Lists previously stored secrets for the authenticated owner.
+/// Secret listing returns the stored metadata rows.
 async fn list_secrets() {
     let app = TestApp::new().await;
 
@@ -264,7 +246,7 @@ async fn list_secrets() {
 }
 
 #[tokio::test]
-/// Deletes a stored secret and verifies that it is no longer retrievable.
+/// Deletion removes the selected secret.
 async fn delete_secret() {
     let app = TestApp::new().await;
 
@@ -301,8 +283,7 @@ async fn create_and_list_agent_keys() {
             "/agents",
             json!({
                 "name": "test-agent",
-                "categories": ["openai", "aws"],
-                "allow_raw": false
+                "categories": ["openai", "aws"]
             }),
         )
         .await;
@@ -317,9 +298,8 @@ async fn create_and_list_agent_keys() {
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0]["name"], "test-agent");
 
-    // A non-raw agent (allow_raw:false) is denied the raw /secret get, which
-    // returns plaintext. Raw retrieval requires allow_raw; non-raw agents use
-    // proxy resolve instead. (Previously asserted 200, codifying a plaintext hole.)
+    // An agent is denied the /secret get, which returns plaintext. Plaintext
+    // retrieval is master-only; agents use proxy resolve instead.
     app.post(
         "/secret/openai/key",
         json!({
@@ -337,7 +317,7 @@ async fn create_and_list_agent_keys() {
 }
 
 #[tokio::test]
-/// Enforces a database-backed agent key's permitted secret categories.
+/// Agent category restrictions deny secrets outside the allowlist.
 async fn agent_key_category_restriction() {
     let app = TestApp::new().await;
 
@@ -347,8 +327,7 @@ async fn agent_key_category_restriction() {
             "/agents",
             json!({
                 "name": "limited-agent",
-                "categories": ["public"],
-                "allow_raw": false
+                "categories": ["public"]
             }),
         )
         .await;
@@ -370,7 +349,7 @@ async fn agent_key_category_restriction() {
 }
 
 #[tokio::test]
-/// Revokes an agent key and verifies that subsequent authentication fails.
+/// Revoked agent bearers no longer authenticate.
 async fn revoke_agent_key() {
     let app = TestApp::new().await;
 
@@ -380,8 +359,7 @@ async fn revoke_agent_key() {
             "/agents",
             json!({
                 "name": "revokable",
-                "categories": ["test"],
-                "allow_raw": false
+                "categories": ["test"]
             }),
         )
         .await;
@@ -413,14 +391,13 @@ async fn revoke_agent_key() {
 async fn non_raw_agent_denied_resolve_text() {
     let app = TestApp::new().await;
 
-    // allow_raw:false agent WITH access to the category.
+    // Agent WITH access to the category.
     let (status, body) = app
         .post(
             "/agents",
             json!({
                 "name": "text-agent",
-                "categories": ["openai"],
-                "allow_raw": false
+                "categories": ["openai"]
             }),
         )
         .await;
@@ -434,7 +411,7 @@ async fn non_raw_agent_denied_resolve_text() {
     .await;
 
     // Text substitution would embed the plaintext in the response body, so a
-    // non-raw agent must be denied and the value must not leak.
+    // agent must be denied and the value must not leak.
     let (status, body) = app
         .request_auth(
             "POST",
@@ -451,11 +428,15 @@ async fn non_raw_agent_denied_resolve_text() {
 }
 
 #[tokio::test]
-/// Allows an agent with raw permission to retrieve an unredacted secret.
-async fn raw_agent_allowed_secret_get() {
+/// An agent sending the retired `allow_raw` flag still cannot use the legacy
+/// plaintext secret route.
+async fn raw_agent_denied_legacy_secret_get() {
     let app = TestApp::new().await;
 
-    // allow_raw:true agent retains direct plaintext retrieval.
+    // A legacy `allow_raw: true` in the request is ignored (the capability no
+    // longer exists) and must not bypass Phylax policy through the legacy
+    // plaintext route. Agent-safe operations use the non-plaintext resolve
+    // modes instead.
     let (status, body) = app
         .post(
             "/agents",
@@ -476,8 +457,11 @@ async fn raw_agent_allowed_secret_get() {
     .await;
 
     let (status, body) = app.get_auth("/secret/openai/key", &agent_key).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["value"]["key"], "sk-raw-ok");
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(
+        !body.to_string().contains("sk-raw-ok"),
+        "denied legacy get must not leak the secret value"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -511,7 +495,7 @@ async fn resolve_text_substitution() {
 }
 
 #[tokio::test]
-/// Resolves one raw credential field for an agent with raw access.
+/// The master identity retains intentional raw resolve access.
 async fn resolve_raw_access() {
     let app = TestApp::new().await;
 

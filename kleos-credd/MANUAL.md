@@ -68,18 +68,60 @@ Response shape:
 - `POST /resolve/text` -- substitution
 - `POST /resolve/proxy` -- proxy
 - `POST /resolve/raw` -- raw fetch
-- `GET /secret/{category}/{name}` -- DB-backed secret lookup
+- `GET /secret/{category}/{name}` -- legacy plaintext lookup, master only
 
-All require category-permissioned DB-backed agent keys. Audit rows are
-written to `cred_audit`.
+The resolve routes take category-permissioned DB-backed agent keys. Audit
+rows are written to `cred_audit`.
 
-`POST /resolve/proxy` denies by default: with no per-category domain
-allowlist configured (`~/.config/cred/proxy-domains.json`), the proxy refuses
-to forward credentials to any host. Configure an allowlist, or set
-`CREDD_PROXY_ALLOW_ANY=1` to forward to any host. This is opt-in and does not
-affect normal credential resolution or first-time setup.
+`GET /secret/{category}/{name}` returns plaintext and is not covered by
+Phylax resolve policy, so it accepts only the master bearer. Agent keys get
+403 (the `allow_raw` capability no longer exists); agents use a non-plaintext resolve mode instead.
 
-Allowlist notes: domain patterns are matched case-insensitively (the target
+`POST /resolve/proxy` denies by default and has no environment opt-out.
+
+Per-secret proxy settings (`proxy_policy`) are accepted by
+`POST`/`PUT /secret/{category}/{name}` next to `data` and stored inside the
+encrypted secret blob:
+
+```json
+{
+  "data": {"type": "api_key", "key": "..."},
+  "proxy_policy": {
+    "allowed_origins": [{"scheme": "https", "host": "api.example.com", "port": 443}],
+    "extra_auth_headers": ["X-Custom-Token"],
+    "drop_response_body": false
+  }
+}
+```
+
+- `allowed_origins`: exact `(scheme, host, port)` triples, port mandatory. A
+  wildcard (`*`, `*.example.com`), empty host, port 0 or a scheme other than
+  http/https is rejected at store time (400). Hosts are lowercased.
+- `extra_auth_headers`: header names the secret may be injected into besides
+  `Authorization` and `X-Api-Key` (case-insensitive). Framing and hop-by-hop
+  headers (`Host`, `Content-Length`, `Set-Cookie`, ...) are rejected.
+- `drop_response_body`: return status and non-sensitive headers with an empty
+  body and `content-length: 0`.
+- On `PUT`, omitting `proxy_policy` keeps the stored one; sending `{}` clears
+  it. Rows written before this field existed load with an empty policy.
+
+Both profiles: `auth_header` must be `Authorization`, `X-Api-Key` or one of
+the secret's extras (400 otherwise); the request carries
+`Accept-Encoding: identity`; the upstream response is scanned for the secret
+(raw, hex, base64 at all alignments, percent, JSON escapes) and every match is
+replaced with `[REDACTED]`, headers value by value and the body streamed. A
+response with a content-encoding the proxy cannot decode is refused.
+
+Custody profile (`PHYLAX_CUSTODY=1`): the target `(scheme, host, effective
+port)` must equal one of the secret's `allowed_origins`, else 403 before any
+DNS lookup or connection; the domain allowlist file below is not consulted.
+Secrets shorter than 3 bytes are refused (400).
+
+Legacy profile: the per-category domain allowlist below still applies. With
+no allowlist configured (`~/.config/cred/proxy-domains.json`) the proxy
+refuses to forward credentials to any host.
+
+Allowlist notes (legacy profile): domain patterns are matched case-insensitively (the target
 host and the configured patterns are both lowercased), so casing in the JSON
 does not matter. Supported forms are exact (`api.github.com`), subdomain
 wildcard (`*.amazonaws.com`, which matches the suffix and any subdomain), and
@@ -125,6 +167,8 @@ Unix-socket connections skip the IP-based portion of the rate limiter.
 | `CREDD_AUTH_MODE` | `yubikey` | `yubikey` or `password`. |
 | `CREDD_MASTER_PASSWORD` | unset | Master password (only with `--auth-mode=password`). |
 | `CREDD_SOCKET` | unset (Linux: `/run/user/$UID/credd.sock` if configured) | Unix socket path. |
+| `CREDD_SOCKET_GROUP` | unset | Group allowed to connect to the Unix socket. The socket is chowned to it at bind time. |
+| `CREDD_SOCKET_MODE` | `0600`, or `0660` with a group | Octal socket mode. Owner read/write is required, world bits are rejected, and group bits need `CREDD_SOCKET_GROUP`. |
 | `CREDD_BIND` | unset | TCP bind address (e.g. `127.0.0.1:4400`). |
 | `CREDD_LISTEN` | `127.0.0.1:4400` | Fallback `--listen` value. |
 | `PHYLAXD_URL` | unset | Preferred client-side HTTP endpoint for the Phylax credential authority. |
@@ -145,7 +189,7 @@ value is used as `CREDD_BIND`.
 | `~/.config/cred/bootstrap.enc` | CBv1-sealed Kleos master bearer. Loaded at startup. |
 | `~/.config/cred/agent-keys.json` | File-backed bootstrap-scoped agent tokens. |
 | `~/.config/systemd/user/credd.service` | Linux systemd unit. Restart with `systemctl --user restart credd`. |
-| `$XDG_RUNTIME_DIR/credd.sock` | Default Unix socket path (chmod 0600). |
+| `$XDG_RUNTIME_DIR/credd.sock` | Default Unix socket path (mode 0600, or `CREDD_SOCKET_MODE`). The process umask is tightened only while the socket is created and restored before serving. |
 
 ### Windows specifics
 
@@ -207,6 +251,35 @@ The flow that bootstraps an agent host with zero plaintext on disk:
 The pre-shared `credd-agent-key.token` file is the current weak link in
 this flow. Replacement design (P-256 ECDH via YubiKey PIV applet, slots 9D
 + 9A) is implemented in `kleos-cred/src/piv.rs`.
+
+## Custody profile (phylaxd, `PHYLAX_CUSTODY=1`)
+
+Setting `PHYLAX_CUSTODY=1` (exactly `1`; any other value warns and runs the
+legacy profile) starts the hardened profile:
+
+- Plaintext-returning routes are not mounted at all: `GET /secret/...`,
+  `POST /resolve/text`, `POST /resolve/raw`, `POST /resolve/derive`, and
+  `GET /bootstrap/kleos-bearer` (the ECDH `POST` variant stays).
+- `POST /agents` is reachable only on the Unix socket by the master identity.
+  The request carries an absolute `key_path`; the key is written there with
+  mode 0600 and `O_EXCL`, and the response contains only the name, a
+  fingerprint, and the creation time.
+- The master bearer is refused with 403 on the TCP listener (an audit log line
+  is written, never the bearer); only agent keys are accepted there. The Unix
+  socket keeps its peer-uid rules.
+- The vault key comes from YubiKey slot 1 with the challenge at
+  `/var/lib/phylax/challenge` (override `PHYLAX_CHALLENGE_PATH`). There is no
+  fallback to slot 2; an unprogrammed slot 1 is a startup error.
+- Startup refuses (typed `CustodyStartupError`): running as uid 1000, a vault
+  database not owned by the daemon's euid or not mode 0600 (a missing file is
+  created 0600), and a TCP bind that is not a literal IPv4 inside
+  `10.50.0.0/24`. The Unix socket is forced to mode 0600 with no group,
+  whatever `CREDD_SOCKET_MODE` / `CREDD_SOCKET_GROUP` say.
+
+Agent keys no longer carry an `allow_raw` capability. Old stored permission
+blobs that still contain the key are read and ignored; the permissions are
+stored as JSON in `cred_agent_keys.permissions`, so there is no column to
+migrate.
 
 ## See also
 

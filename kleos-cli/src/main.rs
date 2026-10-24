@@ -4,6 +4,9 @@ mod import_plugins;
 use hook::{run_hook, HookCommands};
 use kleos_client::{truncate, Client};
 use kleos_lib::config::DEFAULT_CREDENTIAL_AUTHORITY_URL;
+use kleos_lib::cred::custody_client::{
+    custody_target_from_env, CustodyClient, EXEC_UNAVAILABLE_EXIT_CODE, EXEC_UNAVAILABLE_MESSAGE,
+};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
@@ -16,15 +19,25 @@ use serde_json::{json, Value};
 /// Top-level CLI entry point; selects the server URL and dispatches subcommands.
 struct Cli {
     /// Server URL
-    #[arg(long, default_value = "http://127.0.0.1:4200", env = "KLEOS_URL")]
+    #[arg(
+        long,
+        default_value = "http://127.0.0.1:4200",
+        env = "KLEOS_URL",
+        hide_env_values = true
+    )]
     server: String,
 
     /// Preferred Phylax credential authority URL
-    #[arg(long, visible_alias = "credential-authority-url", env = "PHYLAXD_URL")]
+    #[arg(
+        long,
+        visible_alias = "credential-authority-url",
+        env = "PHYLAXD_URL",
+        hide_env_values = true
+    )]
     phylaxd_url: Option<String>,
 
     /// Legacy credd daemon URL
-    #[arg(long, env = "CREDD_URL")]
+    #[arg(long, env = "CREDD_URL", hide_env_values = true)]
     credd_url: Option<String>,
 
     /// API key
@@ -721,18 +734,13 @@ enum JobsCommands {
 }
 
 /// Subcommands for `kleos-cli cred` -- secret CRUD and agent key management via credd.
+///
+/// There is deliberately no `get`: this CLI never prints a stored secret. Use
+/// `exec` to inject one into a child process. When `CRED_CUSTODY` is set,
+/// `set`, `list`, `delete` and `exec` go through the custody thin client
+/// instead of the legacy credd URL.
 #[derive(Subcommand)]
 enum CredCommands {
-    /// Get a secret value
-    Get {
-        /// Category (service namespace)
-        category: String,
-        /// Secret name
-        name: String,
-        /// Output raw value only (no JSON)
-        #[arg(long)]
-        raw: bool,
-    },
     /// Set a secret
     Set {
         /// Category (service namespace)
@@ -772,9 +780,6 @@ enum CredCommands {
         /// Allowed categories (comma-separated, empty = all)
         #[arg(short, long)]
         categories: Option<String>,
-        /// Allow raw access tier
-        #[arg(long)]
-        allow_raw: bool,
     },
     /// List agent keys
     AgentList,
@@ -3240,37 +3245,6 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// Dispatches credential vault subcommands (get, set, delete, list).
 async fn handle_cred_command(client: &Client, cmd: &CredCommands) {
     match cmd {
-        CredCommands::Get {
-            category,
-            name,
-            raw,
-        } => {
-            match client.get(&format!("/secret/{}/{}", category, name)).await {
-                Ok(v) => {
-                    if *raw {
-                        // Extract primary value
-                        if let Some(value) = v.get("value") {
-                            let primary = value
-                                .get("key")
-                                .or_else(|| value.get("password"))
-                                .or_else(|| value.get("client_secret"))
-                                .or_else(|| value.get("private_key"))
-                                .or_else(|| value.get("content"))
-                                .and_then(|v| v.as_str());
-                            if let Some(s) = primary {
-                                println!("{}", s);
-                            } else {
-                                println!("{}", serde_json::to_string(&value).unwrap_or_default());
-                            }
-                        }
-                    } else {
-                        println!("{}", serde_json::to_string_pretty(&v).unwrap());
-                    }
-                }
-                Err(e) => eprintln!("Error: {}", e),
-            }
-        }
-
         CredCommands::Set {
             category,
             name,
@@ -3319,6 +3293,26 @@ async fn handle_cred_command(client: &Client, cmd: &CredCommands) {
                 }),
             };
 
+            if custody_target_from_env().is_some() {
+                // Custody: send through the thin client (agent key only) and
+                // exit non-zero on any failure.
+                let result = match CustodyClient::from_env() {
+                    Ok(custody) => custody.store(category, name, &data).await,
+                    Err(e) => Err(e),
+                };
+                match result {
+                    Ok(stored) => println!(
+                        "Stored {}/{} (id: {})",
+                        stored.category, stored.name, stored.id
+                    ),
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+                return;
+            }
+
             let body = json!({ "data": data });
             match client
                 .post(&format!("/secret/{}/{}", category, name), body)
@@ -3337,6 +3331,25 @@ async fn handle_cred_command(client: &Client, cmd: &CredCommands) {
         }
 
         CredCommands::List { category } => {
+            if custody_target_from_env().is_some() {
+                let result = match CustodyClient::from_env() {
+                    Ok(custody) => custody.list(category.as_deref()).await,
+                    Err(e) => Err(e),
+                };
+                match result {
+                    Ok(rows) if rows.is_empty() => println!("No secrets."),
+                    Ok(rows) => {
+                        for row in &rows {
+                            println!("{}/{} [{}]", row.service, row.key, row.secret_type);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+                return;
+            }
             let path = match category {
                 Some(cat) => format!("/secrets?category={}", cat),
                 None => "/secrets".to_string(),
@@ -3373,6 +3386,20 @@ async fn handle_cred_command(client: &Client, cmd: &CredCommands) {
         }
 
         CredCommands::Delete { category, name } => {
+            if custody_target_from_env().is_some() {
+                let result = match CustodyClient::from_env() {
+                    Ok(custody) => custody.delete(category, name).await,
+                    Err(e) => Err(e),
+                };
+                match result {
+                    Ok(_) => println!("Deleted {}/{}", category, name),
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+                return;
+            }
             match client
                 .delete(&format!("/secret/{}/{}", category, name))
                 .await
@@ -3382,11 +3409,7 @@ async fn handle_cred_command(client: &Client, cmd: &CredCommands) {
             }
         }
 
-        CredCommands::AgentCreate {
-            name,
-            categories,
-            allow_raw,
-        } => {
+        CredCommands::AgentCreate { name, categories } => {
             let cats: Vec<String> = categories
                 .as_deref()
                 .unwrap_or("")
@@ -3398,7 +3421,6 @@ async fn handle_cred_command(client: &Client, cmd: &CredCommands) {
             let body = json!({
                 "name": name,
                 "categories": cats,
-                "allow_raw": allow_raw,
             });
 
             match client.post("/agents", body).await {
@@ -3467,6 +3489,14 @@ async fn handle_cred_command(client: &Client, cmd: &CredCommands) {
             field,
             cmd,
         } => {
+            if custody_target_from_env().is_some() {
+                // Custody has no way to hand a secret to a child until the
+                // credential issuer lands (phase 2); fail clearly instead of
+                // falling back to a plaintext route.
+                eprintln!("Error: {}", EXEC_UNAVAILABLE_MESSAGE);
+                std::process::exit(EXEC_UNAVAILABLE_EXIT_CODE);
+            }
+
             // Two routes depending on what the caller is asking for:
             //
             //   category in {"engram-rust","kleos"} -> per-agent Kleos
@@ -5219,6 +5249,34 @@ mod tests {
         resolve_credential_authority_url, restore_requires_exact_session, sanitize_download_name,
     };
     use kleos_lib::config::DEFAULT_CREDENTIAL_AUTHORITY_URL;
+
+    /// The cred get verb no longer exists, the remaining verbs do, and every
+    /// env-backed global argument hides its value from help output.
+    #[test]
+    fn cred_get_is_removed_and_env_values_are_hidden() {
+        use clap::CommandFactory;
+        let root = super::Cli::command();
+        let cred = root.find_subcommand("cred").expect("cred subcommand");
+        assert!(
+            cred.find_subcommand("get").is_none(),
+            "kleos-cli must not print stored secrets"
+        );
+        for verb in ["set", "list", "delete", "exec"] {
+            assert!(cred.find_subcommand(verb).is_some(), "{verb} missing");
+        }
+        let mut env_args = 0;
+        for arg in root.get_arguments() {
+            if arg.get_env().is_some() {
+                env_args += 1;
+                assert!(
+                    arg.is_hide_env_values_set(),
+                    "{:?} must hide its env value",
+                    arg.get_id()
+                );
+            }
+        }
+        assert!(env_args >= 3, "expected the three URL env args");
+    }
 
     /// Dematerialize only deletes .md files with no traversal component,
     /// and absolute paths only inside ~/.claude/.

@@ -1,7 +1,9 @@
-//! YubiKey HMAC-SHA1 challenge-response on OTP slot 2.
+//! YubiKey HMAC-SHA1 challenge-response on OTP slot 2 (legacy) or slot 1
+//! (Phylax custody profile).
 //!
 //! Slot 2 is used by convention (same as KeePassXC, cred, and anything that
-//! expects to share a secret across tools). The YubiKey holds a 20-byte
+//! expects to share a secret across tools). The custody profile uses slot 1
+//! with its own challenge file and never falls back to slot 2. The YubiKey holds a 20-byte
 //! HMAC-SHA1 key that cannot be extracted; we send it a 32-byte challenge
 //! and receive a 20-byte response. Because the secret never leaves the
 //! hardware, possession of the YubiKey is required to compute the response.
@@ -96,8 +98,17 @@ fn record_success() {
     }
 }
 
-/// OTP slot used for HMAC-SHA1 challenge-response.
+/// OTP slot used for HMAC-SHA1 challenge-response by every legacy caller.
 pub const SLOT: u8 = 2;
+
+/// OTP slot used by the Phylax custody profile. Never falls back to [`SLOT`].
+pub const CUSTODY_SLOT: u8 = 1;
+
+/// Default location of the custody challenge file.
+pub const DEFAULT_CUSTODY_CHALLENGE_PATH: &str = "/var/lib/phylax/challenge";
+
+/// Environment variable overriding [`DEFAULT_CUSTODY_CHALLENGE_PATH`] (tests).
+pub const CUSTODY_CHALLENGE_ENV: &str = "PHYLAX_CHALLENGE_PATH";
 
 /// Challenge size in bytes. YubiKey HMAC-SHA1 accepts 0 to 64 byte challenges;
 /// 32 matches what cred uses and gives us a full SHA-1 input block.
@@ -109,23 +120,59 @@ pub const RESPONSE_SIZE: usize = 20;
 /// Filename for the persisted challenge under the engram config dir.
 const CHALLENGE_FILE: &str = "challenge";
 
-/// Send a challenge to the YubiKey and get the HMAC-SHA1 response.
+/// Send a challenge to the legacy slot ([`SLOT`], slot 2) and get the
+/// HMAC-SHA1 response.
 ///
-/// Uses `ykman otp calculate 2 <hex>` on all platforms, with a Python
-/// fallback on Unix for distros where the ykman wrapper script refuses
-/// to take the HID.
+/// Thin wrapper over [`challenge_response_slot`] kept so every existing
+/// caller continues to use slot 2 unchanged.
 pub fn challenge_response(challenge: &[u8]) -> Result<[u8; RESPONSE_SIZE]> {
+    challenge_response_slot(challenge, SLOT)
+}
+
+/// Reject any OTP slot other than 1 or 2 before a subprocess is spawned.
+fn validate_slot(slot: u8) -> Result<()> {
+    if matches!(slot, 1 | 2) {
+        Ok(())
+    } else {
+        Err(CredError::YubiKey(format!(
+            "invalid YubiKey OTP slot {slot} (expected 1 or 2)"
+        )))
+    }
+}
+
+/// Build the `ykman` argument vector for `otp calculate <slot> <hex>`.
+///
+/// Pure so tests can assert the slot reaches the subprocess verbatim.
+fn calculate_args(slot: u8, challenge_hex: &str) -> Vec<String> {
+    let mut args = device_args();
+    args.extend([
+        "otp".to_string(),
+        "calculate".to_string(),
+        slot.to_string(),
+        challenge_hex.to_string(),
+    ]);
+    args
+}
+
+/// Send a challenge to OTP `slot` (1 or 2) and get the HMAC-SHA1 response.
+///
+/// Uses `ykman otp calculate <slot> <hex>` on all platforms, with a Python
+/// fallback on Unix for distros where the ykman wrapper script refuses
+/// to take the HID. Both attempts use the same slot: there is no fallback to
+/// a different slot, so an unprogrammed slot surfaces as a hard error.
+pub fn challenge_response_slot(challenge: &[u8], slot: u8) -> Result<[u8; RESPONSE_SIZE]> {
+    validate_slot(slot)?;
     check_rate_limit()?;
 
     let challenge_hex = hex::encode(challenge);
 
     #[cfg(not(windows))]
-    let output = try_ykman_calculate(&challenge_hex)
-        .or_else(|first| try_python_ykman_calculate(&challenge_hex).map_err(|_| first))
+    let output = try_ykman_calculate(slot, &challenge_hex)
+        .or_else(|first| try_python_ykman_calculate(slot, &challenge_hex).map_err(|_| first))
         .inspect_err(|_| record_failure())?;
 
     #[cfg(windows)]
-    let output = try_ykman_calculate_win(&challenge_hex).inspect_err(|_| record_failure())?;
+    let output = try_ykman_calculate_win(slot, &challenge_hex).inspect_err(|_| record_failure())?;
 
     let decoded = hex::decode(output.trim()).map_err(|e| {
         record_failure();
@@ -144,7 +191,10 @@ pub fn challenge_response(challenge: &[u8]) -> Result<[u8; RESPONSE_SIZE]> {
     let mut response = [0u8; RESPONSE_SIZE];
     response.copy_from_slice(&decoded);
     record_success();
-    debug!("YubiKey challenge-response ok ({} bytes)", RESPONSE_SIZE);
+    debug!(
+        slot,
+        "YubiKey challenge-response ok ({} bytes)", RESPONSE_SIZE
+    );
     Ok(response)
 }
 
@@ -271,11 +321,32 @@ pub fn derive_master_key() -> Result<[u8; crate::crypto::KEY_SIZE]> {
 /// refuse to overwrite it: that file protects an encrypted database and
 /// silently regenerating would make the database unrecoverable.
 pub fn get_or_create_challenge() -> Result<[u8; CHALLENGE_SIZE]> {
-    let dir = config_dir();
-    let path = dir.join(CHALLENGE_FILE);
+    get_or_create_challenge_at(&config_dir().join(CHALLENGE_FILE))
+}
 
+/// Resolve the custody challenge path: `PHYLAX_CHALLENGE_PATH` when set and
+/// non-empty, otherwise [`DEFAULT_CUSTODY_CHALLENGE_PATH`].
+pub fn custody_challenge_path() -> PathBuf {
+    custody_challenge_path_from(std::env::var(CUSTODY_CHALLENGE_ENV).ok().as_deref())
+}
+
+/// Pure form of [`custody_challenge_path`] taking the env override explicitly.
+fn custody_challenge_path_from(override_path: Option<&str>) -> PathBuf {
+    match override_path {
+        Some(p) if !p.is_empty() => PathBuf::from(p),
+        _ => PathBuf::from(DEFAULT_CUSTODY_CHALLENGE_PATH),
+    }
+}
+
+/// Load or create the 32-byte challenge stored at `path`.
+///
+/// A new file is created with `O_EXCL` and mode 0600 (parent directory
+/// created 0700 if missing). An existing file with the wrong size is never
+/// overwritten: it protects an encrypted database, and regenerating it would
+/// make that database unrecoverable.
+pub fn get_or_create_challenge_at(path: &std::path::Path) -> Result<[u8; CHALLENGE_SIZE]> {
     if path.exists() {
-        let data = std::fs::read(&path)
+        let data = std::fs::read(path)
             .map_err(|e| CredError::YubiKey(format!("read challenge {}: {}", path.display(), e)))?;
         if data.len() != CHALLENGE_SIZE {
             return Err(CredError::YubiKey(format!(
@@ -293,22 +364,56 @@ pub fn get_or_create_challenge() -> Result<[u8; CHALLENGE_SIZE]> {
     let mut challenge = [0u8; CHALLENGE_SIZE];
     OsRng
         .try_fill_bytes(&mut challenge)
-        .expect("OS CSPRNG must be available");
+        .map_err(|e| CredError::YubiKey(format!("OS CSPRNG unavailable: {e}")))?;
 
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| CredError::YubiKey(format!("mkdir {}: {}", dir.display(), e)))?;
-    std::fs::write(&path, challenge)
-        .map_err(|e| CredError::YubiKey(format!("write challenge {}: {}", path.display(), e)))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| CredError::YubiKey(format!("chmod 600 {}: {}", path.display(), e)))?;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        create_private_dir(dir)?;
     }
+    write_new_private_file(path, &challenge)?;
 
     info!("generated new engram challenge at {}", path.display());
     Ok(challenge)
+}
+
+/// Create `dir` (and parents) when missing; newly created leaf is mode 0700.
+fn create_private_dir(dir: &std::path::Path) -> Result<()> {
+    if dir.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir)
+        .map_err(|e| CredError::YubiKey(format!("mkdir {}: {}", dir.display(), e)))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| CredError::YubiKey(format!("chmod 700 {}: {}", dir.display(), e)))?;
+    }
+    Ok(())
+}
+
+/// Create `path` with `O_EXCL` and mode 0600 and write `bytes` to it.
+fn write_new_private_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|e| CredError::YubiKey(format!("create challenge {}: {}", path.display(), e)))?;
+    file.write_all(bytes)
+        .map_err(|e| CredError::YubiKey(format!("write challenge {}: {}", path.display(), e)))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| CredError::YubiKey(format!("chmod 600 {}: {}", path.display(), e)))?;
+    }
+    Ok(())
 }
 
 /// Software fallback for HMAC-SHA1 challenge-response (testing only).
@@ -357,14 +462,8 @@ fn device_args() -> Vec<String> {
 }
 
 #[cfg(windows)]
-fn try_ykman_calculate_win(challenge_hex: &str) -> Result<String> {
-    let mut args = device_args();
-    args.extend([
-        "otp".to_string(),
-        "calculate".to_string(),
-        SLOT.to_string(),
-        challenge_hex.to_string(),
-    ]);
+fn try_ykman_calculate_win(slot: u8, challenge_hex: &str) -> Result<String> {
+    let args = calculate_args(slot, challenge_hex);
 
     let out = Command::new("ykman").args(&args).output().map_err(|e| {
         CredError::YubiKey(format!(
@@ -385,14 +484,8 @@ fn try_ykman_calculate_win(challenge_hex: &str) -> Result<String> {
 }
 
 #[cfg(not(windows))]
-fn try_ykman_calculate(challenge_hex: &str) -> Result<String> {
-    let mut args = device_args();
-    args.extend([
-        "otp".to_string(),
-        "calculate".to_string(),
-        SLOT.to_string(),
-        challenge_hex.to_string(),
-    ]);
+fn try_ykman_calculate(slot: u8, challenge_hex: &str) -> Result<String> {
+    let args = calculate_args(slot, challenge_hex);
 
     let out = Command::new("ykman").args(&args).output().map_err(|e| {
         CredError::YubiKey(format!(
@@ -413,7 +506,7 @@ fn try_ykman_calculate(challenge_hex: &str) -> Result<String> {
 }
 
 #[cfg(not(windows))]
-fn try_python_ykman_calculate(challenge_hex: &str) -> Result<String> {
+fn try_python_ykman_calculate(slot: u8, challenge_hex: &str) -> Result<String> {
     // H-011: pass args via env vars -- never interpolate into the script body.
     const SCRIPT: &str = r#"
 import os, sys
@@ -438,7 +531,7 @@ main()
             SCRIPT,
         ])
         .env("YKMAN_DEVICE", &yk_serial)
-        .env("YKMAN_ARG_1", SLOT.to_string())
+        .env("YKMAN_ARG_1", slot.to_string())
         .env("YKMAN_ARG_2", challenge_hex)
         .output()
         .map_err(|e| CredError::YubiKey(format!("sudo python3 ykman failed: {}", e)))?;
@@ -689,6 +782,72 @@ mod tests {
         assert_eq!(CHALLENGE_SIZE, 32);
         assert_eq!(RESPONSE_SIZE, 20);
         assert_eq!(SLOT, 2);
+        assert_eq!(CUSTODY_SLOT, 1);
+    }
+
+    /// Only OTP slots 1 and 2 pass validation; anything else is rejected
+    /// before a subprocess is spawned.
+    #[test]
+    fn slot_validation_accepts_only_one_and_two() {
+        assert!(validate_slot(1).is_ok());
+        assert!(validate_slot(2).is_ok());
+        assert!(validate_slot(0).is_err());
+        assert!(validate_slot(3).is_err());
+        assert!(challenge_response_slot(&[0u8; CHALLENGE_SIZE], 9).is_err());
+    }
+
+    /// The requested slot is passed to `ykman otp calculate` verbatim, so the
+    /// custody path (slot 1) can never silently use slot 2.
+    #[test]
+    fn calculate_args_carry_the_requested_slot() {
+        let custody = calculate_args(CUSTODY_SLOT, "aa");
+        let legacy = calculate_args(SLOT, "aa");
+        assert!(custody.windows(3).any(|w| w == ["calculate", "1", "aa"]));
+        assert!(legacy.windows(3).any(|w| w == ["calculate", "2", "aa"]));
+    }
+
+    /// The custody challenge path honours the env override and otherwise
+    /// falls back to the fixed system location.
+    #[test]
+    fn custody_challenge_path_override_and_default() {
+        assert_eq!(
+            custody_challenge_path_from(None),
+            PathBuf::from("/var/lib/phylax/challenge")
+        );
+        assert_eq!(
+            custody_challenge_path_from(Some("")),
+            PathBuf::from("/var/lib/phylax/challenge")
+        );
+        assert_eq!(
+            custody_challenge_path_from(Some("/tmp/x/challenge")),
+            PathBuf::from("/tmp/x/challenge")
+        );
+    }
+
+    /// A fresh challenge file is created 0600 in a 0700 directory, is stable
+    /// across reads, and a wrong-sized file is never overwritten.
+    #[cfg(unix)]
+    #[test]
+    fn challenge_at_creates_private_file_and_refuses_resize() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("phylax").join("challenge");
+        let first = get_or_create_challenge_at(&path).unwrap();
+        let second = get_or_create_challenge_at(&path).unwrap();
+        assert_eq!(first, second);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let dir_mode = std::fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700);
+
+        std::fs::write(&path, b"short").unwrap();
+        assert!(get_or_create_challenge_at(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"short");
     }
 
     /// H-011: verify that a malicious argument cannot cause shell/Python injection.
@@ -697,7 +856,8 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn malicious_arg_does_not_inject() {
-        let result = try_python_ykman_calculate("'); import os; os.system('touch /tmp/PWNED'); ('");
+        let result =
+            try_python_ykman_calculate(SLOT, "'); import os; os.system('touch /tmp/PWNED'); ('");
         // ykman will reject the bad hex -- we just care it errored, not which error
         assert!(result.is_err());
         assert!(!std::path::Path::new("/tmp/PWNED").exists());

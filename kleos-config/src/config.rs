@@ -85,6 +85,11 @@ pub enum EncryptionMode {
     Env,
     /// YubiKey HMAC-SHA1 challenge-response on slot 2, derived via Argon2id.
     Yubikey,
+    /// Phylax custody profile: the same YubiKey HMAC derivation as `Yubikey`,
+    /// but from OTP slot 1 with the challenge persisted at
+    /// `/var/lib/phylax/challenge` (override: `PHYLAX_CHALLENGE_PATH`). There
+    /// is no fallback to slot 2; an unprogrammed slot 1 is a hard error.
+    Custody,
 }
 
 /// Encryption settings for the main SQLite database.
@@ -1312,6 +1317,7 @@ impl Config {
                 "keyfile" => EncryptionMode::Keyfile,
                 "env" => EncryptionMode::Env,
                 "yubikey" => EncryptionMode::Yubikey,
+                "custody" => EncryptionMode::Custody,
                 other => {
                     tracing::warn!("unknown ENGRAM_ENCRYPTION_MODE={}, using none", other);
                     EncryptionMode::None
