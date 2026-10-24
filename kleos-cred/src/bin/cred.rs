@@ -1485,7 +1485,6 @@ async fn main() -> Result<()> {
             dry_run,
         } => cmd_rekey(
             &cli.auth_mode,
-            cli.master_password.as_deref(),
             cli.keyfile.as_deref(),
             &to,
             new_keyfile.as_deref(),
@@ -1507,18 +1506,14 @@ async fn main() -> Result<()> {
             names,
         } => cmd_v3_audit(
             &cli.auth_mode,
-            cli.master_password.as_deref(),
             cli.keyfile.as_deref(),
             &also_keyfiles,
             &also_challenges,
             names,
         ),
-        Commands::RecoveryKit { cmd } => cmd_recovery_kit(
-            &cli.auth_mode,
-            cli.master_password.as_deref(),
-            cli.keyfile.as_deref(),
-            cmd,
-        ),
+        Commands::RecoveryKit { cmd } => {
+            cmd_recovery_kit(&cli.auth_mode, cli.keyfile.as_deref(), cmd)
+        }
         cmd => {
             // Resolve encryption config. ENGRAM_ENCRYPTION_MODE wins; when it is
             // absent (e.g. an agent process launched before the vault was
@@ -1884,7 +1879,7 @@ fn cmd_v3_import(source_keyfile: Option<&Path>, dry_run: bool) -> Result<()> {
     let (entries, _) = kleos_cred::rekey::parse_v3_listing(&json);
     let (master, at_rest) = local_vault_keys()?;
     let source = match source_keyfile {
-        Some(path) => derive_master_key("keyfile", None, Some(path))?,
+        Some(path) => derive_master_key("keyfile", Some(path))?,
         None => master.clone(),
     };
     let report = kleos_cred::rekey::import_v3_entries(
@@ -1902,7 +1897,6 @@ fn cmd_v3_import(source_keyfile: Option<&Path>, dry_run: bool) -> Result<()> {
 /// Summarize which candidate keys open the central CRED:v3 entries on stdin.
 fn cmd_v3_audit(
     auth_mode: &str,
-    master_password: Option<&str>,
     keyfile: Option<&Path>,
     also_keyfiles: &[PathBuf],
     also_challenges: &[PathBuf],
@@ -1919,12 +1913,12 @@ fn cmd_v3_audit(
 
     let mut keys: Vec<(String, Zeroizing<[u8; KEY_SIZE]>)> = vec![(
         format!("current ({auth_mode})"),
-        derive_master_key(auth_mode, master_password, keyfile)?,
+        derive_master_key(auth_mode, keyfile)?,
     )];
     for path in also_keyfiles {
         keys.push((
             path.display().to_string(),
-            derive_master_key("keyfile", None, Some(path))?,
+            derive_master_key("keyfile", Some(path))?,
         ));
     }
     for path in also_challenges {
@@ -2032,12 +2026,7 @@ fn read_terminal_passphrase(prompt: &str) -> Result<Zeroizing<String>> {
 }
 
 /// Create, verify, or restore a passphrase-wrapped master-key recovery kit.
-fn cmd_recovery_kit(
-    auth_mode: &str,
-    master_password: Option<&str>,
-    keyfile: Option<&Path>,
-    cmd: RecoveryKitCmd,
-) -> Result<()> {
+fn cmd_recovery_kit(auth_mode: &str, keyfile: Option<&Path>, cmd: RecoveryKitCmd) -> Result<()> {
     use kleos_cred::rekey::{
         keys_match, unwrap_master_key, wrap_master_key, write_new_private_file,
     };
@@ -2047,7 +2036,7 @@ fn cmd_recovery_kit(
             if out.exists() {
                 anyhow::bail!("{} already exists; refusing to overwrite", out.display());
             }
-            let master = derive_master_key(auth_mode, master_password, keyfile)?;
+            let master = derive_master_key(auth_mode, keyfile)?;
             let passphrase = read_terminal_passphrase("recovery passphrase (12+ chars): ")?;
             let confirm = read_terminal_passphrase("confirm passphrase: ")?;
             if passphrase.as_str() != confirm.as_str() {
@@ -2069,7 +2058,7 @@ fn cmd_recovery_kit(
             let blob = std::fs::read(&from).with_context(|| format!("read {}", from.display()))?;
             let passphrase = read_terminal_passphrase("recovery passphrase: ")?;
             let recovered = unwrap_master_key(&passphrase, &blob)?;
-            let master = derive_master_key(auth_mode, master_password, keyfile)?;
+            let master = derive_master_key(auth_mode, keyfile)?;
             if keys_match(&recovered, &master) {
                 eprintln!("MATCH: this kit opens the current vault");
                 Ok(())
@@ -2096,7 +2085,6 @@ fn cmd_recovery_kit(
 /// caches, and reports only counts and failing row identifiers.
 fn cmd_rekey(
     auth_mode: &str,
-    master_password: Option<&str>,
     keyfile: Option<&Path>,
     to: &str,
     new_keyfile: Option<&Path>,
@@ -2110,9 +2098,9 @@ fn cmd_rekey(
         anyhow::bail!("rekey supports only a plaintext-at-rest cache; this vault is configured for at-rest encryption");
     }
     eprintln!("deriving current key ({auth_mode})...");
-    let old_key = derive_master_key(auth_mode, master_password, keyfile)?;
+    let old_key = derive_master_key(auth_mode, keyfile)?;
     eprintln!("deriving target key ({to})...");
-    let new_key = derive_master_key(to, None, new_keyfile)?;
+    let new_key = derive_master_key(to, new_keyfile)?;
 
     let db = db_path();
     let report = rekey_database(&db, &old_key, &new_key, dry_run)?;
