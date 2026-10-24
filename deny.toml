@@ -53,6 +53,16 @@ ignore = [
     { id = "RUSTSEC-2026-0367", reason = "zip extract SUID; kleos never calls extract; zip 9 migration tracked separately; reviewed 2026-10-23" },
     { id = "RUSTSEC-2026-0368", reason = "zip extract symlink escape; kleos never calls extract; zip 9 migration tracked separately; reviewed 2026-10-23" },
     { id = "RUSTSEC-2026-0369", reason = "zip extract permissions via symlink; kleos never calls extract; zip 9 migration tracked separately; reviewed 2026-10-23" },
+    # crypto-bigint 0.5.5: timing variability in operations meant to be
+    # constant-time (RUSTSEC-2026-0387). The fix is 0.7.6 and there is no
+    # patched 0.5.x; 0.7 arrives only with the RustCrypto 0.14 line (p256,
+    # p384, ssh-key, yubikey all pin 0.5 today), a migration tracked
+    # separately. Exposure here: signature verification uses public operands
+    # only; PIV P-256 signing runs on the YubiKey; software P-256 signing is
+    # limited to custody leaf issuance (one signature per rotation inside the
+    # custody daemon) and the ECDH bootstrap. Review on every p256 or
+    # elliptic-curve bump.
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 timing; no patched 0.5.x; fix needs RustCrypto 0.14 migration; verify paths public-only, PIV signing on token; reviewed 2026-10-24" },
 ]
 
 [licenses]
