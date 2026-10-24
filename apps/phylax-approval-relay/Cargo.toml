@@ -1,0 +1,23 @@
+[package]
+name = "phylax-approval-relay"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["json"] }
+base64 = "0.22"
+rand = "0.9"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+subtle = "2.5"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[workspace]
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }

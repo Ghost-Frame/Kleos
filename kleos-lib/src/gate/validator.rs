@@ -104,7 +104,7 @@ pub fn check_dangerous_patterns(command: &str, config: &Config) -> Option<String
         }
     }
     if (cmd_lower.contains("sample") || cmd_lower.contains("demo"))
-        && (cmd_lower.contains("insert") || cmd_lower.contains("create"))
+        && looks_like_sql_seed(&cmd_lower)
     {
         return Some("Inserting sample/demo data requires explicit authorization".to_string());
     }
@@ -291,4 +291,27 @@ pub fn check_dangerous_patterns(command: &str, config: &Config) -> Option<String
     }
 
     None
+}
+
+/// Return whether a lowercased command contains an SQL seeding statement
+/// (`insert into`, `create table`, `create database`, `create schema`).
+/// The sample/demo rule used to fire on the bare words "insert" and "create",
+/// which also match ordinary prose such as "created for" in a runbook being
+/// written to disk, so the match is narrowed to statement shapes.
+fn looks_like_sql_seed(cmd_lower: &str) -> bool {
+    // Shell quoting glues punctuation to the keywords (`"insert`, `'create`),
+    // so strip everything that is not a word character before matching.
+    let words: Vec<&str> = cmd_lower
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric() && c != '_'))
+        .collect();
+    words.windows(2).any(|pair| {
+        matches!(
+            (pair[0], pair[1]),
+            ("insert", "into")
+                | ("create", "table")
+                | ("create", "database")
+                | ("create", "schema")
+        )
+    })
 }

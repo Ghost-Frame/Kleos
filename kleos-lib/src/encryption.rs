@@ -39,6 +39,11 @@ pub fn resolve_key(config: &Config) -> Result<Option<[u8; KEY_SIZE]>> {
              Database::connect_encrypted()"
                 .into(),
         )),
+        EncryptionMode::Custody => Err(EngError::Encryption(
+            "custody mode must be resolved at the binary level via \
+             kleos_cred::encryption::resolve_at_rest_key (YubiKey slot 1)"
+                .into(),
+        )),
     }
 }
 

@@ -56,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
         args.auth_mode.as_str(),
         args.master_password,
         args.keyfile,
+        kleos_credd::profile::RunProfile::Legacy,
         kleos_credd::build_router,
     )
     .await?;

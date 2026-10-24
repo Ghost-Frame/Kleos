@@ -41,10 +41,13 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
 async-trait.workspace = true
-nix = { version = "0.29", features = ["user"] }
+nix = { version = "0.29", features = ["fs", "user"] }
 rpassword = "7"
 anyhow = "1"
 hex = "0.4"
+# Response redaction: multi-needle streaming scan and base64 needle generation.
+aho-corasick = "1"
+base64.workspace = true
 subtle = { workspace = true }
 zeroize = { workspace = true }
 rand = { workspace = true }
@@ -60,6 +63,7 @@ aes-gcm = "0.10"
 sha2 = { workspace = true }
 
 [dev-dependencies]
+proptest = "1"
 tokio = { workspace = true, features = ["test-util", "macros"] }
 reqwest.workspace = true
 http-body-util = "0.1"
