@@ -1,0 +1,34 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'phylax.approver'
+    compileSdk 36
+
+    defaultConfig {
+        applicationId 'phylax.approver'
+        minSdk 31
+        targetSdk 36
+        versionCode 1
+        versionName '0.1.0'
+        testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
+        buildConfigField 'String', 'PHYLAX_RELAY_BASE_URL',
+                '"' + providers.gradleProperty('phylaxRelayBaseUrl').getOrElse('') + '"'
+        // Approval link host, also pinned into the App Link intent filter.
+        def approvalHost = providers.gradleProperty('phylaxApprovalHost').getOrElse('approve.example.com')
+        buildConfigField 'String', 'PHYLAX_APPROVAL_HOST', '"' + approvalHost + '"'
+        manifestPlaceholders = [phylaxApprovalHost: approvalHost]
+    }
+
+    buildFeatures {
+        buildConfig true
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+}

@@ -50,7 +50,7 @@ You can expect an initial response within 72 hours. We'll work with you to under
 - `kleos-credd` handles secrets with AES-256-GCM encryption
 - Master password never stored -- used to derive encryption key
 - Agent keys are scoped and rotatable
-- `allow_raw` flag is explicitly opt-in and logged
+- Agent keys never receive plaintext: the `allow_raw` capability was removed, and the plaintext routes are master-only (and not mounted at all under the Phylax custody profile)
 
 ### Audit Trail
 

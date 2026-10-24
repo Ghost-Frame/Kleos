@@ -2,12 +2,16 @@
 //!
 //! Compatible with private cred's data format when using legacy mode.
 
+use std::ffi::OsString;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use argon2::{password_hash::SaltString, Argon2, Params, PasswordHasher};
 use clap::{Parser, Subcommand};
+use kleos_lib::cred::custody_client::{
+    CustodyClient, CUSTODY_ENV, EXEC_UNAVAILABLE_EXIT_CODE, EXEC_UNAVAILABLE_MESSAGE,
+};
 use rand::rngs::OsRng;
 use rand::TryRngCore;
 use sha2::{Digest, Sha256};
@@ -58,20 +62,218 @@ struct Cli {
     /// challenge against slot 2. `password` reads --master-password / stdin
     /// and derives via the same Argon2id KDF. `keyfile` reads the pre-derived
     /// 32-byte key (hex-encoded) from a file -- for unattended servers.
-    #[arg(long, default_value = "yubikey", env = "CRED_AUTH_MODE", global = true)]
+    #[arg(
+        long,
+        default_value = "yubikey",
+        env = "CRED_AUTH_MODE",
+        hide_env_values = true,
+        global = true
+    )]
     auth_mode: String,
 
-    /// Master password (only used when --auth-mode=password).
-    #[arg(long, env = "CRED_MASTER_PASSWORD", global = true)]
-    master_password: Option<String>,
+    /// Read the master password interactively (only used when
+    /// --auth-mode=password). Takes no value: the password is read from
+    /// /dev/tty with echo off, or as one line from stdin when no terminal
+    /// exists. It is never accepted on the command line or from the
+    /// environment, so it cannot appear in `ps` or `/proc/<pid>/environ`.
+    #[arg(long, global = true)]
+    master_password: bool,
 
     /// Path to keyfile containing hex-encoded 32-byte master key
     /// (only used when --auth-mode=keyfile).
-    #[arg(long, env = "CRED_KEYFILE", global = true)]
+    #[arg(long, env = "CRED_KEYFILE", hide_env_values = true, global = true)]
     keyfile: Option<PathBuf>,
+
+    /// Talk to a custody-profile daemon (`host:port` or URL) instead of the
+    /// local vault. Handled before parsing: when this flag or CRED_CUSTODY is
+    /// set, only the custody command set is available and nothing is unlocked.
+    #[arg(
+        long,
+        value_name = "TARGET",
+        env = "CRED_CUSTODY",
+        hide_env_values = true,
+        global = true
+    )]
+    custody: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
+}
+
+/// Command line used when a custody daemon is the target.
+///
+/// This is a separate clap tree on purpose: verbs that print, export or
+/// persist plaintext locally (get, export, export-key, session, bootstrap,
+/// tui, import, init, recover, kdf-salt-init) do not exist here, so clap
+/// rejects them as unknown subcommands rather than refusing them at runtime.
+/// Nothing in this mode unlocks a vault or opens a local database.
+#[derive(Parser)]
+#[command(name = "cred", version, about = "Credential client (custody mode)")]
+struct CustodyCli {
+    /// Custody daemon, `host:port` or URL. Plain http is accepted for loopback
+    /// only; any other host must use https.
+    #[arg(
+        long,
+        value_name = "TARGET",
+        env = "CRED_CUSTODY",
+        hide_env_values = true,
+        global = true
+    )]
+    custody: Option<String>,
+
+    /// Ignored under custody (no local master key is derived); accepted so a
+    /// shell that exports it keeps working. A warning is printed.
+    #[arg(long, env = "CRED_AUTH_MODE", hide_env_values = true, global = true)]
+    auth_mode: Option<String>,
+
+    /// Ignored under custody; accepted for the same reason. A warning is printed.
+    #[arg(long, global = true)]
+    master_password: bool,
+
+    /// Ignored under custody; accepted for the same reason. A warning is printed.
+    #[arg(long, env = "CRED_KEYFILE", hide_env_values = true, global = true)]
+    keyfile: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: CustodyCommands,
+}
+
+/// The complete command set available in custody mode.
+#[derive(Subcommand)]
+enum CustodyCommands {
+    /// Store a secret on the custody daemon (prompts interactively).
+    Store {
+        /// Service name (e.g., grafana, postgres)
+        service: String,
+        /// Key name (e.g., admin, api-key)
+        key: String,
+        /// Secret type: api-key, login, oauth-app, ssh-key, note, environment
+        #[arg(short = 't', long, default_value = "api-key")]
+        secret_type: String,
+    },
+    /// List stored secrets (names and types only)
+    List {
+        /// Filter by service name
+        #[arg(short, long)]
+        service: Option<String>,
+    },
+    /// Delete a secret on the custody daemon
+    Delete {
+        /// Service name
+        service: String,
+        /// Key name
+        key: String,
+        /// Skip confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// Run a command with a secret injected. Not available until the
+    /// credential issuer lands (phase 2); the arguments are parsed so the
+    /// command line has the same shape as the legacy exec.
+    #[allow(dead_code)]
+    Exec {
+        /// Service name
+        service: String,
+        /// Key name
+        key: String,
+        /// Extract a specific field
+        #[arg(short, long)]
+        field: Option<String>,
+        /// Env var name to inject the secret as
+        #[arg(short = 'e', long, conflicts_with = "stdin")]
+        env: Option<String>,
+        /// Pipe secret to child stdin instead of an env var
+        #[arg(long)]
+        stdin: bool,
+        /// Hash the value before injection
+        #[arg(long)]
+        hash: Option<String>,
+        /// Command and args to run. Use `--` to separate from cred's flags.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Manage agent keys on the custody daemon
+    AgentKey {
+        #[command(subcommand)]
+        action: CustodyAgentKeyAction,
+    },
+    /// SSH certificate authority operations performed by the daemon
+    SshCa {
+        #[command(subcommand)]
+        cmd: CustodySshCaCmd,
+    },
+    /// Inspect local YubiKey PIV slots
+    Piv {
+        #[command(subcommand)]
+        cmd: CustodyPivCmd,
+    },
+}
+
+/// Agent key actions available in custody mode.
+#[derive(Subcommand)]
+enum CustodyAgentKeyAction {
+    /// Create an agent key. The daemon writes the key to `--out` (a path on
+    /// the daemon host, mode 0600, must not exist) and only the name and a
+    /// fingerprint come back.
+    Generate {
+        /// Agent name/identifier
+        name: String,
+        /// Category allow-list (comma-separated or repeated; empty = all)
+        #[arg(short, long = "category", value_delimiter = ',')]
+        categories: Vec<String>,
+        /// Absolute path on the daemon host the key is written to
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// List agent keys
+    List,
+    /// Revoke an agent key
+    Revoke {
+        /// Agent name to revoke
+        name: String,
+        /// Skip confirmation
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+}
+
+/// SSH CA actions available in custody mode.
+#[derive(Subcommand)]
+enum CustodySshCaCmd {
+    /// Ask the daemon to sign an agent's public key into a certificate.
+    Sign {
+        /// Key identity string (typically agent name).
+        #[arg(short = 'I', long)]
+        identity: String,
+        /// Valid principal(s), comma-separated.
+        #[arg(short = 'n', long, default_value = "operator")]
+        principal: String,
+        /// Validity period (e.g. +1h, +30m, +5m).
+        #[arg(short = 'V', long, default_value = "+1h")]
+        ttl: String,
+        /// Path to the agent's public key to sign.
+        pubkey: PathBuf,
+    },
+    /// Ask the daemon to mint an agent keypair and certificate. The private
+    /// key stays on the daemon host; the certificate is printed.
+    Mint {
+        /// Agent name (used as key ID).
+        #[arg(long)]
+        agent: String,
+        /// Valid principal(s), comma-separated.
+        #[arg(short = 'n', long, default_value = "operator")]
+        principal: String,
+        /// Validity period (e.g. +1h, +30m, +5m).
+        #[arg(long, default_value = "+1h")]
+        ttl: String,
+    },
+}
+
+/// PIV actions available in custody mode (read-only).
+#[derive(Subcommand)]
+enum CustodyPivCmd {
+    /// Show which PIV slots have keys provisioned plus fingerprints.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -346,6 +548,11 @@ enum AgentKeyAction {
         /// file-backed bootstrap store.
         #[arg(long)]
         scope: Vec<String>,
+        /// File the new key is written to (created exclusively, mode 0600;
+        /// must not already exist). The key is never printed: only the name
+        /// and a fingerprint are shown.
+        #[arg(long)]
+        out: PathBuf,
     },
     /// List all agent keys (DB-backed only; use `cred bootstrap unwrap`
     /// or read ~/.config/cred/agent-keys.json for file-backed tokens).
@@ -377,6 +584,88 @@ enum GetAccessContext {
     Interactive,
     ManagedSession,
     Agent,
+}
+
+/// Number of hex characters of the key digest shown as a fingerprint.
+const KEY_FINGERPRINT_HEX_LEN: usize = 16;
+
+/// Non-reversible identifier for an agent key: the first 16 hex characters of
+/// the SHA-256 of the key text. Safe to print and log; it cannot authenticate.
+fn key_fingerprint(key: &str) -> String {
+    let digest = hex::encode(Sha256::digest(key.as_bytes()));
+    digest[..KEY_FINGERPRINT_HEX_LEN].to_string()
+}
+
+/// Pure policy for printing a recovered or generated HMAC secret.
+///
+/// Printing is allowed on an interactive stderr, or when the operator opted in
+/// with `CRED_ALLOW_PRINT=1` (exactly `"1"`). Anything else could land in a
+/// log, CI capture or agent transcript.
+fn secret_print_allowed_with(stderr_is_tty: bool, allow_print: Option<&str>) -> bool {
+    stderr_is_tty || allow_print == Some("1")
+}
+
+/// [`secret_print_allowed_with`] applied to the real stderr and environment.
+fn print_secret_allowed() -> bool {
+    secret_print_allowed_with(
+        io::stderr().is_terminal(),
+        std::env::var("CRED_ALLOW_PRINT").ok().as_deref(),
+    )
+}
+
+/// Create `path` exclusively (`O_EXCL`) with mode 0600 and return the handle.
+///
+/// An existing file, directory or symlink at `path` is an error: secrets are
+/// never written over something that was already there, and the file is never
+/// visible under a looser mode (the mode is applied at creation).
+fn create_private_file(path: &Path) -> Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path).with_context(|| {
+        format!(
+            "cannot create {} (it must not already exist)",
+            path.display()
+        )
+    })?;
+    // The creation mode is masked by the umask; pin it to exactly 0600.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("cannot chmod {}", path.display()))?;
+    }
+    Ok(file)
+}
+
+/// Create `path` exclusively with mode 0600 and write `data` to it.
+///
+/// If the write fails the partial file is removed so no truncated secret is
+/// left behind.
+fn write_new_private(path: &Path, data: &[u8]) -> Result<()> {
+    let mut file = create_private_file(path)?;
+    if let Err(e) = file.write_all(data).and_then(|()| file.sync_all()) {
+        discard_key_file(path);
+        return Err(e).with_context(|| format!("cannot write {}", path.display()));
+    }
+    Ok(())
+}
+
+/// Write an agent key and a trailing newline to its already-created file.
+fn write_key_file(file: &mut std::fs::File, key: &str) -> Result<()> {
+    file.write_all(key.as_bytes())
+        .and_then(|()| file.write_all(b"\n"))
+        .and_then(|()| file.sync_all())
+        .context("cannot write the agent key file")
+}
+
+/// Best-effort removal of a key file created for a command that then failed.
+fn discard_key_file(path: &Path) {
+    let _ = std::fs::remove_file(path);
 }
 
 fn config_dir() -> PathBuf {
@@ -460,21 +749,45 @@ fn derive_master_key_yubikey() -> Result<[u8; KEY_SIZE]> {
     Ok(derive_master_key_yubikey_with_response()?.0)
 }
 
-fn derive_master_key(
-    auth_mode: &str,
-    master_password: Option<&str>,
-    keyfile: Option<&Path>,
-) -> Result<Zeroizing<[u8; KEY_SIZE]>> {
+/// Read one master password line from `reader`, stripping the line ending.
+///
+/// Used when no terminal exists (a pipe or file on stdin). Fails on EOF or an
+/// empty line so an unattended run cannot silently derive a key from "".
+fn read_password_line<R: BufRead>(reader: &mut R) -> Result<Zeroizing<String>> {
+    let mut line = Zeroizing::new(String::new());
+    let read = reader
+        .read_line(&mut line)
+        .context("failed to read master password from stdin")?;
+    anyhow::ensure!(read > 0, "no master password supplied on stdin");
+    while line.ends_with('\n') || line.ends_with('\r') {
+        line.pop();
+    }
+    anyhow::ensure!(!line.is_empty(), "master password is empty");
+    Ok(line)
+}
+
+/// Read the master password without ever taking it from argv or the
+/// environment: from `/dev/tty` with echo off when a controlling terminal
+/// exists, otherwise one line from stdin. The returned buffer zeroizes on drop.
+fn read_master_password() -> Result<Zeroizing<String>> {
+    if std::fs::File::open("/dev/tty").is_ok() {
+        eprint!("Enter master password: ");
+        io::stderr().flush()?;
+        let password = rpassword::read_password().context("failed to read master password")?;
+        eprintln!();
+        return Ok(Zeroizing::new(password));
+    }
+    read_password_line(&mut io::stdin().lock())
+}
+
+/// Derive the local master key for `auth_mode` (`yubikey`, `password` or
+/// `keyfile`). The password mode reads from the terminal or stdin only; it has
+/// no argv or environment input.
+fn derive_master_key(auth_mode: &str, keyfile: Option<&Path>) -> Result<Zeroizing<[u8; KEY_SIZE]>> {
     match auth_mode {
         "yubikey" => derive_master_key_yubikey().map(Zeroizing::new),
         "password" => {
-            let password = match master_password {
-                Some(pw) => pw.to_string(),
-                None => {
-                    eprintln!("Enter master password: ");
-                    rpassword::read_password()?
-                }
-            };
+            let password = read_master_password()?;
             Ok(kleos_cred::crypto::derive_key(1, password.as_bytes(), None))
         }
         "keyfile" => {
@@ -716,9 +1029,348 @@ async fn cmd_session(cmd: SessionCmd) -> Result<()> {
     }
 }
 
+/// True when the command line or environment selects custody mode.
+///
+/// Scans `args` (skipping the program name, stopping at a bare `--`) for
+/// `--custody` or `--custody=...`, and treats a non-blank `env_value` (the
+/// `CRED_CUSTODY` variable) the same way. This runs before clap so the legacy
+/// command tree is never even built for a custody invocation.
+fn custody_requested(args: &[OsString], env_value: Option<&str>) -> bool {
+    for arg in args.iter().skip(1) {
+        let Some(arg) = arg.to_str() else { continue };
+        if arg == "--" {
+            break;
+        }
+        if arg == "--custody" || arg.starts_with("--custody=") {
+            return true;
+        }
+    }
+    env_value.is_some_and(|value| !value.trim().is_empty())
+}
+
+/// Warnings for local-unlock flags that custody mode ignores.
+fn ignored_local_flag_warnings(
+    auth_mode: Option<&str>,
+    master_password: bool,
+    keyfile: Option<&Path>,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if auth_mode.is_some() {
+        warnings.push(
+            "warning: --auth-mode/CRED_AUTH_MODE is ignored in custody mode (no local key is derived)"
+                .to_string(),
+        );
+    }
+    if master_password {
+        warnings.push(
+            "warning: --master-password is ignored in custody mode (no password is read)"
+                .to_string(),
+        );
+    }
+    if keyfile.is_some() {
+        warnings.push(
+            "warning: --keyfile/CRED_KEYFILE is ignored in custody mode (no keyfile is read)"
+                .to_string(),
+        );
+    }
+    warnings
+}
+
+/// Report that `exec` is unavailable under custody and exit with code 2.
+///
+/// Exec needs the credential issuer (phase 2); until then no custody path can
+/// hand a secret to a child process, so the verb exists only to fail clearly.
+fn custody_exec_unavailable() -> ! {
+    eprintln!("error: {EXEC_UNAVAILABLE_MESSAGE}");
+    std::process::exit(EXEC_UNAVAILABLE_EXIT_CODE)
+}
+
+/// Ask a yes/no question on stdout and read the answer from stdin.
+fn confirm(prompt: &str) -> Result<bool> {
+    print!("{prompt} [y/N] ");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input.trim().eq_ignore_ascii_case("y"))
+}
+
+/// One row of the secret listing table (names and types, never values).
+struct SecretLine {
+    /// Service (category) name.
+    service: String,
+    /// Key (secret) name.
+    key: String,
+    /// Secret type label.
+    secret_type: String,
+}
+
+/// Print the `SERVICE  KEY  TYPE` table shared by local and custody listings.
+fn print_secret_table(lines: &[SecretLine]) {
+    if lines.is_empty() {
+        println!("no secrets stored");
+        return;
+    }
+    let max_svc = lines
+        .iter()
+        .map(|l| l.service.len())
+        .max()
+        .unwrap_or(7)
+        .max(7);
+    let max_key = lines.iter().map(|l| l.key.len()).max().unwrap_or(3).max(3);
+
+    println!(
+        "{:<width_s$}  {:<width_k$}  TYPE",
+        "SERVICE",
+        "KEY",
+        width_s = max_svc,
+        width_k = max_key,
+    );
+    println!(
+        "{:-<width_s$}  {:-<width_k$}  {:-<10}",
+        "",
+        "",
+        "",
+        width_s = max_svc,
+        width_k = max_key,
+    );
+    for line in lines {
+        println!(
+            "{:<width_s$}  {:<width_k$}  {}",
+            line.service,
+            line.key,
+            line.secret_type,
+            width_s = max_svc,
+            width_k = max_key,
+        );
+    }
+    println!("\n{} secret(s)", lines.len());
+}
+
+/// Entry point for custody mode: no unlock, no local database.
+///
+/// Every verb either talks to the daemon through [`CustodyClient`] (agent key
+/// bearer only) or is a local read-only PIV inspection. `exec` fails with the
+/// phase-2 message and exit code 2 before any network or key lookup.
+async fn run_custody(cli: CustodyCli) -> Result<()> {
+    let CustodyCli {
+        custody,
+        auth_mode,
+        master_password,
+        keyfile,
+        command,
+    } = cli;
+    for warning in
+        ignored_local_flag_warnings(auth_mode.as_deref(), master_password, keyfile.as_deref())
+    {
+        eprintln!("{warning}");
+    }
+    let target = || custody.clone().context("no custody target given");
+
+    match command {
+        CustodyCommands::Exec { .. } => custody_exec_unavailable(),
+        CustodyCommands::Piv {
+            cmd: CustodyPivCmd::Status,
+        } => cmd_piv(PivCmd::Status).await,
+        CustodyCommands::Store {
+            service,
+            key,
+            secret_type,
+        } => {
+            let client = CustodyClient::from_target(&target()?)?;
+            cmd_custody_store(&client, &service, &key, &secret_type).await
+        }
+        CustodyCommands::List { service } => {
+            let client = CustodyClient::from_target(&target()?)?;
+            cmd_custody_list(&client, service.as_deref()).await
+        }
+        CustodyCommands::Delete { service, key, yes } => {
+            let client = CustodyClient::from_target(&target()?)?;
+            cmd_custody_delete(&client, &service, &key, yes).await
+        }
+        CustodyCommands::AgentKey { action } => {
+            let client = CustodyClient::from_target(&target()?)?;
+            cmd_custody_agent_key(&client, action).await
+        }
+        CustodyCommands::SshCa { cmd } => {
+            let client = CustodyClient::from_target(&target()?)?;
+            cmd_custody_ssh_ca(&client, cmd).await
+        }
+    }
+}
+
+/// Prompt for a secret locally and send it to the daemon; nothing is echoed back.
+async fn cmd_custody_store(
+    client: &CustodyClient,
+    service: &str,
+    key: &str,
+    secret_type: &str,
+) -> Result<()> {
+    let data = prompt_secret_data(secret_type)?;
+    let payload = serde_json::to_value(&data).context("failed to encode secret")?;
+    let stored = client.store(service, key, &payload).await?;
+    eprintln!("stored: {}/{}", stored.category, stored.name);
+    Ok(())
+}
+
+/// List secret names and types held by the daemon.
+async fn cmd_custody_list(client: &CustodyClient, service: Option<&str>) -> Result<()> {
+    let lines: Vec<SecretLine> = client
+        .list(service)
+        .await?
+        .into_iter()
+        .map(|row| SecretLine {
+            service: row.service,
+            key: row.key,
+            secret_type: row.secret_type,
+        })
+        .collect();
+    print_secret_table(&lines);
+    Ok(())
+}
+
+/// Delete a secret on the daemon after an optional confirmation.
+async fn cmd_custody_delete(
+    client: &CustodyClient,
+    service: &str,
+    key: &str,
+    skip_confirm: bool,
+) -> Result<()> {
+    if !skip_confirm && !confirm(&format!("delete {service}/{key}?"))? {
+        eprintln!("aborted.");
+        return Ok(());
+    }
+    let deleted = client.delete(service, key).await?;
+    anyhow::ensure!(deleted.deleted, "daemon did not delete {service}/{key}");
+    eprintln!("deleted: {}/{}", deleted.category, deleted.name);
+    Ok(())
+}
+
+/// Agent key management through the daemon.
+async fn cmd_custody_agent_key(
+    client: &CustodyClient,
+    action: CustodyAgentKeyAction,
+) -> Result<()> {
+    match action {
+        CustodyAgentKeyAction::Generate {
+            name,
+            categories,
+            out,
+        } => {
+            anyhow::ensure!(
+                out.is_absolute(),
+                "--out must be an absolute path on the daemon host"
+            );
+            let out_str = out
+                .to_str()
+                .context("--out must be valid UTF-8 for the daemon request")?;
+            let created = client
+                .agent_key_generate(&name, &categories, out_str)
+                .await?;
+            println!("name: {}", created.name);
+            println!("fingerprint: {}", created.fingerprint);
+            Ok(())
+        }
+        CustodyAgentKeyAction::List => {
+            let keys = client.agent_key_list().await?;
+            if keys.is_empty() {
+                println!("no agent keys");
+                return Ok(());
+            }
+            println!(
+                "{:<20} {:<10} {:<20} CATEGORIES",
+                "NAME", "STATUS", "CREATED"
+            );
+            println!("{:-<20} {:-<10} {:-<20} {:-<16}", "", "", "", "");
+            for key in &keys {
+                let status = if key.is_valid { "active" } else { "revoked" };
+                let categories = if key.categories.is_empty() {
+                    "*".to_string()
+                } else {
+                    key.categories.join(",")
+                };
+                println!(
+                    "{:<20} {:<10} {:<20} {}",
+                    key.name, status, key.created_at, categories
+                );
+            }
+            println!("\n{} key(s)", keys.len());
+            Ok(())
+        }
+        CustodyAgentKeyAction::Revoke { name, yes } => {
+            if !yes && !confirm(&format!("revoke agent key '{name}'?"))? {
+                eprintln!("aborted.");
+                return Ok(());
+            }
+            let revoked = client.agent_key_revoke(&name).await?;
+            anyhow::ensure!(revoked.revoked, "daemon did not revoke '{name}'");
+            eprintln!("revoked agent key: {}", revoked.name);
+            Ok(())
+        }
+    }
+}
+
+/// SSH CA signing and minting performed by the daemon.
+async fn cmd_custody_ssh_ca(client: &CustodyClient, cmd: CustodySshCaCmd) -> Result<()> {
+    match cmd {
+        CustodySshCaCmd::Sign {
+            identity,
+            principal,
+            ttl,
+            pubkey,
+        } => {
+            let public_key = std::fs::read_to_string(&pubkey)
+                .with_context(|| format!("read public key from {}", pubkey.display()))?;
+            let signed = client
+                .ssh_ca_sign(&identity, &principal, &ttl, &public_key)
+                .await?;
+            let stem = pubkey
+                .to_string_lossy()
+                .trim_end_matches(".pub")
+                .to_string();
+            let cert_path = PathBuf::from(format!("{stem}-cert.pub"));
+            std::fs::write(&cert_path, signed.cert_public_key)
+                .with_context(|| format!("write certificate to {}", cert_path.display()))?;
+            println!("{}", cert_path.display());
+            Ok(())
+        }
+        CustodySshCaCmd::Mint {
+            agent,
+            principal,
+            ttl,
+        } => {
+            let minted = client.ssh_ca_mint(&agent, &principal, &ttl).await?;
+            eprintln!(
+                "minted certificate for {} (principal {}, ttl {}); the private key stays on the daemon host",
+                minted.agent, minted.principal, minted.ttl
+            );
+            println!("{}", minted.cert_public_key.trim_end());
+            Ok(())
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    if std::env::var_os("CRED_MASTER_PASSWORD").is_some() {
+        eprintln!(
+            "warning: CRED_MASTER_PASSWORD is no longer read; use --master-password to be prompted"
+        );
+    }
+
+    // Custody mode is decided before clap so the legacy command tree (which
+    // has verbs that print plaintext) is never parsed for it.
+    let args: Vec<OsString> = std::env::args_os().collect();
+    if custody_requested(&args, std::env::var(CUSTODY_ENV).ok().as_deref()) {
+        return run_custody(CustodyCli::parse_from(args)).await;
+    }
+
     let cli = Cli::parse();
+    if cli.custody.is_some() {
+        anyhow::bail!("custody target is blank; set CRED_CUSTODY or --custody to host:port");
+    }
+    if cli.master_password && cli.auth_mode != "password" {
+        eprintln!("warning: --master-password is ignored unless --auth-mode=password");
+    }
 
     match cli.command {
         Commands::Init => cmd_init().await,
@@ -756,11 +1408,7 @@ async fn main() -> Result<()> {
                     kleos_cred::encryption::resolve_at_rest_key(&enc_config, Some(&response[..]))?;
                 (Zeroizing::new(master), at_rest)
             } else {
-                let master = derive_master_key(
-                    &cli.auth_mode,
-                    cli.master_password.as_deref(),
-                    cli.keyfile.as_deref(),
-                )?;
+                let master = derive_master_key(&cli.auth_mode, cli.keyfile.as_deref())?;
                 let at_rest = kleos_cred::encryption::resolve_at_rest_key(&enc_config, None)?;
                 (master, at_rest)
             };
@@ -887,17 +1535,10 @@ async fn cmd_export_key(master_key: &[u8; KEY_SIZE], out: Option<PathBuf>) -> Re
         .context("keyfile path has no parent directory")?;
     std::fs::create_dir_all(dir)?;
 
-    let hex_key = hex::encode(master_key);
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    std::fs::write(&tmp, format!("{}\n", hex_key))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    }
-
-    std::fs::rename(&tmp, &path)?;
+    // Created exclusively with mode 0600 from the first byte: the key is never
+    // on disk under a looser mode, and an existing file is never overwritten.
+    let hex_key = Zeroizing::new(format!("{}\n", hex::encode(master_key)));
+    write_new_private(&path, hex_key.as_bytes())?;
     eprintln!("master key exported to {} (mode 0600)", path.display());
     eprintln!(
         "use CRED_AUTH_MODE=keyfile CRED_KEYFILE={} for unattended access",
@@ -930,6 +1571,17 @@ async fn cmd_init() -> Result<()> {
     // Create config directory
     std::fs::create_dir_all(&config)?;
 
+    // The recovery file is created exclusively and never overwritten; refuse
+    // before generating or programming anything so a failure cannot strand a
+    // freshly programmed YubiKey without its recovery kit.
+    let recovery_path = config.join("recovery.enc");
+    if recovery_path.exists() {
+        anyhow::bail!(
+            "{} already exists; move it aside before re-initializing (cred never overwrites a recovery file)",
+            recovery_path.display()
+        );
+    }
+
     // Generate HMAC secret
     eprintln!("generating 20-byte HMAC-SHA1 secret...");
     let secret = generate_hmac_secret();
@@ -938,16 +1590,10 @@ async fn cmd_init() -> Result<()> {
     // SECURITY: refuse to print the HMAC secret to a non-terminal stderr to
     // avoid accidental capture in logs or CI pipelines. Set CRED_ALLOW_PRINT=1
     // to override when piping output intentionally.
-    {
-        use std::io::IsTerminal;
-        let force_print = std::env::var("CRED_ALLOW_PRINT")
-            .map(|v| v == "1")
-            .unwrap_or(false);
-        if !force_print && !std::io::stderr().is_terminal() {
-            eprintln!("ERROR: refusing to print secret -- stderr is not a terminal");
-            eprintln!("Set CRED_ALLOW_PRINT=1 to override");
-            std::process::exit(1);
-        }
+    if !print_secret_allowed() {
+        eprintln!("ERROR: refusing to print secret -- stderr is not a terminal");
+        eprintln!("Set CRED_ALLOW_PRINT=1 to override");
+        std::process::exit(1);
     }
     eprintln!();
     eprintln!("HMAC secret (save this in Bitwarden NOW):");
@@ -990,14 +1636,7 @@ async fn cmd_init() -> Result<()> {
     }
 
     let recovery_data = encrypt_recovery(&passphrase, &secret)?;
-    let recovery_path = config.join("recovery.enc");
-    std::fs::write(&recovery_path, &recovery_data)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&recovery_path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    write_new_private(&recovery_path, &recovery_data)?;
 
     eprintln!("recovery file written to: {}", recovery_path.display());
 
@@ -1055,7 +1694,14 @@ async fn cmd_recover(from: &str) -> Result<()> {
         }
     }
 
-    // If no YubiKey or user declined, show the hex
+    // If no YubiKey or user declined, show the hex -- but only to a terminal,
+    // exactly like `cred init`, so the secret cannot land in captured logs.
+    if !print_secret_allowed() {
+        anyhow::bail!(
+            "refusing to print the recovered HMAC secret -- stderr is not a terminal; \
+             set CRED_ALLOW_PRINT=1 to override"
+        );
+    }
     eprintln!("HMAC secret (hex): {}", hex::encode(&secret));
     eprintln!("program a YubiKey manually:");
     eprintln!("  ykman otp chalresp 2 --force {}", hex::encode(&secret));
@@ -1161,12 +1807,12 @@ async fn cmd_exec(
         anyhow::bail!("no command specified after `--`");
     }
 
-    let (_row, data) = match storage::get_secret(db, CRED_USER_ID, service, key, master_key).await {
-        Ok(result) => result,
-        Err(_) => resolve_via_credd(master_key, service, key)
-            .await
-            .context("secret not found in local DB or credd")?,
-    };
+    // Local vault only. There is deliberately no network fallback: the old
+    // GET /secret fallback sent the master key to credd as a bearer and pulled
+    // plaintext back over HTTP.
+    let (_row, data) = storage::get_secret(db, CRED_USER_ID, service, key, master_key)
+        .await
+        .with_context(|| format!("secret {service}/{key} not found in the local vault"))?;
 
     let mut value = if let Some(field_name) = field {
         data.get_field(field_name).ok_or_else(|| {
@@ -1229,55 +1875,16 @@ async fn cmd_list(
     _master_key: &[u8; KEY_SIZE],
     service_filter: Option<&str>,
 ) -> Result<()> {
-    let secrets = storage::list_secrets(db, CRED_USER_ID, service_filter).await?;
-
-    if secrets.is_empty() {
-        println!("no secrets stored");
-        return Ok(());
-    }
-
-    // Find column widths
-    let max_svc = secrets
-        .iter()
-        .map(|s| s.category.len())
-        .max()
-        .unwrap_or(7)
-        .max(7);
-    let max_key = secrets
-        .iter()
-        .map(|s| s.name.len())
-        .max()
-        .unwrap_or(3)
-        .max(3);
-
-    println!(
-        "{:<width_s$}  {:<width_k$}  TYPE",
-        "SERVICE",
-        "KEY",
-        width_s = max_svc,
-        width_k = max_key,
-    );
-    println!(
-        "{:-<width_s$}  {:-<width_k$}  {:-<10}",
-        "",
-        "",
-        "",
-        width_s = max_svc,
-        width_k = max_key,
-    );
-
-    for row in &secrets {
-        println!(
-            "{:<width_s$}  {:<width_k$}  {}",
-            row.category,
-            row.name,
-            row.secret_type.as_str(),
-            width_s = max_svc,
-            width_k = max_key,
-        );
-    }
-
-    println!("\n{} secret(s)", secrets.len());
+    let lines: Vec<SecretLine> = storage::list_secrets(db, CRED_USER_ID, service_filter)
+        .await?
+        .into_iter()
+        .map(|row| SecretLine {
+            service: row.category,
+            key: row.name,
+            secret_type: row.secret_type.as_str().to_string(),
+        })
+        .collect();
+    print_secret_table(&lines);
     Ok(())
 }
 
@@ -1493,16 +2100,10 @@ async fn cmd_export(
 
     match output {
         Some(path) => {
-            // Write atomically with owner-only perms so the plaintext export
-            // never lands on disk world-readable.
-            let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-            std::fs::write(&tmp, &json)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-            }
-            std::fs::rename(&tmp, &path)?;
+            // Created exclusively with mode 0600 from the first byte so the
+            // plaintext export is never on disk world-readable and never
+            // overwrites an existing file.
+            write_new_private(&path, json.as_bytes())?;
             eprintln!(
                 "exported {} secret(s) to {} (mode 0600)",
                 entries.len(),
@@ -1910,6 +2511,7 @@ async fn cmd_agent_key(db: &Database, action: AgentKeyAction) -> Result<()> {
             name,
             description,
             scope,
+            out,
         } => {
             // Any `bootstrap/*` scope routes the token to the file-backed
             // store so a fresh shell can read it before the cred DB is
@@ -1933,45 +2535,66 @@ async fn cmd_agent_key(db: &Database, action: AgentKeyAction) -> Result<()> {
                 );
             }
 
+            // The key file is created (exclusively, mode 0600) before any key
+            // exists, so a bad or already-used path fails without minting.
+            // The key is written there and never printed.
+            let mut out_file = create_private_file(&out)?;
+
             if !bootstrap_scopes.is_empty() {
                 // File-backed bootstrap-agent token.
-                let mut store = FileAgentKeyStore::load()
-                    .map_err(|e| anyhow::anyhow!("load agent-keys.json: {}", e))?;
-                let key_hex = store
-                    .generate(&name, &description, scope.clone())
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                let mut store = match FileAgentKeyStore::load() {
+                    Ok(store) => store,
+                    Err(e) => {
+                        discard_key_file(&out);
+                        return Err(anyhow::anyhow!("load agent-keys.json: {}", e));
+                    }
+                };
+                let key_hex = match store.generate(&name, &description, scope.clone()) {
+                    Ok(key) => Zeroizing::new(key),
+                    Err(e) => {
+                        discard_key_file(&out);
+                        return Err(anyhow::anyhow!("{}", e));
+                    }
+                };
+                if let Err(e) = write_key_file(&mut out_file, &key_hex) {
+                    discard_key_file(&out);
+                    let _ = store.revoke(&name);
+                    return Err(e);
+                }
                 eprintln!("minted bootstrap-agent token for '{}'", name);
                 if !description.is_empty() {
                     eprintln!("description: {}", description);
                 }
                 eprintln!("scopes: {}", scope.join(", "));
-                eprintln!();
-                eprintln!("token (save this now -- it cannot be retrieved later):");
-                println!("{}", key_hex);
-                eprintln!();
-                eprintln!("To make this shell's hook bootstrap pick it up:");
-                eprintln!(
-                    "  echo '{}' > ~/.config/cred/credd-agent-key.token",
-                    key_hex
-                );
-                eprintln!("  chmod 600 ~/.config/cred/credd-agent-key.token");
+                eprintln!("key written to {} (mode 0600)", out.display());
+                println!("name: {}", name);
+                println!("fingerprint: {}", key_fingerprint(&key_hex));
                 Ok(())
             } else {
                 // DB-backed three-tier resolve agent key.
                 let perms = kleos_cred::AgentKeyPermissions::default();
                 let (key_str, agent_key) =
-                    agent_keys::create_agent_key(db, CRED_USER_ID, &name, &perms)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("{}", e))?;
+                    match agent_keys::create_agent_key(db, CRED_USER_ID, &name, &perms).await {
+                        Ok(created) => created,
+                        Err(e) => {
+                            discard_key_file(&out);
+                            return Err(anyhow::anyhow!("{}", e));
+                        }
+                    };
+                let key_str = Zeroizing::new(key_str);
+                if let Err(e) = write_key_file(&mut out_file, &key_str) {
+                    discard_key_file(&out);
+                    let _ = agent_keys::delete_agent_key(db, CRED_USER_ID, &name).await;
+                    return Err(e);
+                }
                 eprintln!("generated agent key for '{}'", name);
                 if !description.is_empty() {
                     eprintln!("description: {}", description);
                 }
-                eprintln!();
-                eprintln!("key (save this now -- it cannot be retrieved later):");
-                println!("{}", key_str);
-                eprintln!();
                 eprintln!("key id: {}", agent_key.id);
+                eprintln!("key written to {} (mode 0600)", out.display());
+                println!("name: {}", name);
+                println!("fingerprint: {}", key_fingerprint(&key_str));
                 Ok(())
             }
         }
@@ -2594,58 +3217,6 @@ fn draw_detail_modal(f: &mut Frame, secret: &TuiSecret, show_value: bool) {
             .title(" detail "),
     );
     f.render_widget(detail, modal_area);
-}
-
-// --- credd fallback for secret resolution ---
-
-async fn resolve_via_credd(
-    master_key: &[u8; KEY_SIZE],
-    service: &str,
-    key: &str,
-) -> Result<(storage::SecretRow, kleos_cred::types::SecretData)> {
-    let credd_url = std::env::var("CREDD_URL").unwrap_or_else(|_| "http://127.0.0.1:4400".into());
-    // The master key authenticates to credd as a Bearer token (credd's auth
-    // model). Refuse to send it over a plaintext non-loopback hop.
-    kleos_cred::net::guard_credd_transport(&credd_url)?;
-    let auth_token = hex::encode(master_key);
-
-    let resp = reqwest::Client::new()
-        .get(format!(
-            "{}/secret/{}/{}",
-            credd_url.trim_end_matches('/'),
-            service,
-            key
-        ))
-        .header("Authorization", format!("Bearer {}", auth_token))
-        .timeout(std::time::Duration::from_secs(5))
-        .send()
-        .await
-        .context("credd unreachable")?;
-
-    if !resp.status().is_success() {
-        anyhow::bail!("credd returned {}", resp.status());
-    }
-
-    let body: serde_json::Value = resp.json().await.context("invalid credd response")?;
-
-    let data: kleos_cred::types::SecretData =
-        serde_json::from_value(body["value"].clone()).context("failed to parse secret data")?;
-
-    let secret_type_str = body["type"].as_str().unwrap_or("api_key");
-    let secret_type = kleos_cred::types::SecretType::parse(secret_type_str)
-        .unwrap_or(kleos_cred::types::SecretType::ApiKey);
-
-    let row = storage::SecretRow {
-        id: 0,
-        user_id: CRED_USER_ID,
-        name: key.to_string(),
-        category: service.to_string(),
-        secret_type,
-        created_at: String::new(),
-        updated_at: String::new(),
-    };
-
-    Ok((row, data))
 }
 
 // --- Bootstrap blob (CBv1) wrap / unwrap ---
@@ -3611,5 +4182,285 @@ mod get_session_guard_tests {
 
         let reloaded = load_get_session_grants(&path).unwrap();
         assert!(reloaded.grants.is_empty());
+    }
+}
+
+/// Tests for the custody thin-client wiring and the hardened secret handling.
+#[cfg(test)]
+mod custody_thin_client_tests {
+    use super::*;
+    use clap::CommandFactory;
+    use std::io::Cursor;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Build an argv vector from string slices.
+    fn argv(parts: &[&str]) -> Vec<OsString> {
+        parts.iter().map(OsString::from).collect()
+    }
+
+    /// One line from a non-terminal stdin is the password, minus its newline.
+    #[test]
+    fn password_is_read_from_a_non_tty_stdin_line() {
+        let mut lf = Cursor::new(b"hunter2\nsecond line\n".to_vec());
+        assert_eq!(read_password_line(&mut lf).unwrap().as_str(), "hunter2");
+        let mut crlf = Cursor::new(b"hunter2\r\n".to_vec());
+        assert_eq!(read_password_line(&mut crlf).unwrap().as_str(), "hunter2");
+        let mut no_newline = Cursor::new(b"hunter2".to_vec());
+        assert_eq!(
+            read_password_line(&mut no_newline).unwrap().as_str(),
+            "hunter2"
+        );
+    }
+
+    /// Empty input and empty lines are refused rather than deriving from "".
+    #[test]
+    fn empty_password_input_is_refused() {
+        assert!(read_password_line(&mut Cursor::new(Vec::new())).is_err());
+        assert!(read_password_line(&mut Cursor::new(b"\n".to_vec())).is_err());
+        assert!(read_password_line(&mut Cursor::new(b"\r\n".to_vec())).is_err());
+    }
+
+    /// A private file is created 0600 and an existing one is never touched.
+    #[test]
+    fn private_file_is_0600_and_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.key");
+        write_new_private(&path, b"first\n").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o600);
+
+        let err = write_new_private(&path, b"second\n").unwrap_err();
+        assert!(err.to_string().contains("must not already exist"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"first\n");
+
+        // A symlink at the target is refused, not followed.
+        let target = dir.path().join("victim");
+        std::fs::write(&target, b"victim").unwrap();
+        let link = dir.path().join("link.key");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(write_new_private(&link, b"x").is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"victim");
+    }
+
+    /// The fingerprint is the first 16 hex of the SHA-256 of the key text.
+    #[test]
+    fn fingerprint_is_sha256_prefix() {
+        assert_eq!(key_fingerprint("abc"), "ba7816bf8f01cfea");
+        assert_eq!(key_fingerprint("abc").len(), KEY_FINGERPRINT_HEX_LEN);
+        assert_ne!(key_fingerprint("abc"), key_fingerprint("abd"));
+    }
+
+    /// Generating a DB-backed key writes it to --out (0600), refuses an
+    /// existing path without minting anything, and never returns the key.
+    #[tokio::test]
+    async fn agent_key_generate_writes_key_file_and_refuses_existing() {
+        let db = Database::connect_memory().await.expect("in-memory db");
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("agent.key");
+        let action = || AgentKeyAction::Generate {
+            name: "thin-client-agent".to_string(),
+            description: String::new(),
+            scope: Vec::new(),
+            out: out.clone(),
+        };
+
+        cmd_agent_key(&db, action()).await.unwrap();
+        let mode = std::fs::metadata(&out).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o600);
+        let key = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(key.trim().len(), 64, "32-byte hex key");
+        assert!(key.ends_with('\n'));
+
+        // Second run at the same path fails before minting a second key.
+        let err = cmd_agent_key(&db, action()).await.unwrap_err();
+        assert!(err.to_string().contains("must not already exist"), "{err}");
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), key);
+        let keys = kleos_cred::agent_keys::list_agent_keys(&db, CRED_USER_ID)
+            .await
+            .unwrap();
+        assert_eq!(keys.len(), 1, "the refused run must not mint a key");
+    }
+
+    /// Every clap arg that reads an environment variable hides its value, in
+    /// both command trees and all of their subcommands.
+    #[test]
+    fn every_env_arg_hides_its_value() {
+        fn walk(cmd: &clap::Command, seen: &mut Vec<String>) {
+            for arg in cmd.get_arguments() {
+                if let Some(env) = arg.get_env() {
+                    let name = env.to_string_lossy().into_owned();
+                    assert!(
+                        arg.is_hide_env_values_set(),
+                        "{name} on `{}` must set hide_env_values",
+                        cmd.get_name()
+                    );
+                    seen.push(name);
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                walk(sub, seen);
+            }
+        }
+        let mut seen = Vec::new();
+        walk(&Cli::command(), &mut seen);
+        walk(&CustodyCli::command(), &mut seen);
+        for expected in ["CRED_AUTH_MODE", "CRED_KEYFILE", "CRED_CUSTODY"] {
+            assert!(seen.iter().any(|n| n == expected), "{expected} not found");
+        }
+        assert!(
+            !seen.iter().any(|n| n == "CRED_MASTER_PASSWORD"),
+            "the master password must not be readable from the environment"
+        );
+    }
+
+    /// --master-password takes no value in either tree.
+    #[test]
+    fn master_password_flag_takes_no_value() {
+        for cmd in [Cli::command(), CustodyCli::command()] {
+            let arg = cmd
+                .get_arguments()
+                .find(|a| a.get_id() == "master_password")
+                .expect("flag present");
+            assert!(!arg.get_action().takes_values());
+            assert!(arg.get_env().is_none());
+        }
+        // A value after the flag is not consumed as a password.
+        assert!(Cli::try_parse_from(["cred", "--master-password", "pw", "list"]).is_err());
+        let cli = Cli::try_parse_from(["cred", "--master-password", "list"]).unwrap();
+        assert!(cli.master_password);
+    }
+
+    /// The HMAC print policy needs a terminal or an exact CRED_ALLOW_PRINT=1.
+    #[test]
+    fn hmac_print_guard_policy() {
+        assert!(!secret_print_allowed_with(false, None));
+        assert!(!secret_print_allowed_with(false, Some("0")));
+        assert!(!secret_print_allowed_with(false, Some("true")));
+        assert!(!secret_print_allowed_with(false, Some("")));
+        assert!(secret_print_allowed_with(false, Some("1")));
+        assert!(secret_print_allowed_with(true, None));
+    }
+
+    /// `cred recover` consults the guard before it prints the HMAC hex, and
+    /// `cred init` shares the same helper.
+    #[test]
+    fn recover_and_init_use_the_print_guard() {
+        let source = include_str!("cred.rs");
+        let body = |name: &str| {
+            let start = source.find(name).expect("function present");
+            let end = source[start..].find("\n}\n").expect("function end") + start;
+            &source[start..end]
+        };
+        let recover = body("async fn cmd_recover");
+        let guard = recover.find("print_secret_allowed()").expect("guard call");
+        let print = recover.find("HMAC secret (hex)").expect("print");
+        assert!(guard < print, "guard must precede the print");
+        assert!(body("async fn cmd_init").contains("print_secret_allowed()"));
+    }
+
+    /// Custody mode is selected by the flag or a non-blank env value only.
+    #[test]
+    fn custody_mode_selection() {
+        assert!(custody_requested(
+            &argv(&["cred", "--custody", "h:1", "list"]),
+            None
+        ));
+        assert!(custody_requested(
+            &argv(&["cred", "list", "--custody=h:1"]),
+            None
+        ));
+        assert!(custody_requested(&argv(&["cred", "list"]), Some("h:1")));
+        assert!(!custody_requested(&argv(&["cred", "list"]), None));
+        assert!(!custody_requested(&argv(&["cred", "list"]), Some("  ")));
+        // Arguments after `--` belong to the child command.
+        assert!(!custody_requested(
+            &argv(&["cred", "exec", "a", "b", "--", "tool", "--custody"]),
+            None
+        ));
+    }
+
+    /// The custody tree contains exactly the allowed verbs.
+    #[test]
+    fn custody_tree_has_only_the_allowed_verbs() {
+        let command = CustodyCli::command();
+        let mut names: Vec<&str> = command.get_subcommands().map(|c| c.get_name()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec![
+                "agent-key",
+                "delete",
+                "exec",
+                "list",
+                "piv",
+                "ssh-ca",
+                "store"
+            ]
+        );
+    }
+
+    /// Plaintext-handling verbs are unknown subcommands under custody.
+    #[test]
+    fn forbidden_verbs_are_unknown_under_custody() {
+        for verb in [
+            "get",
+            "export",
+            "export-key",
+            "session",
+            "bootstrap",
+            "tui",
+            "import",
+            "init",
+            "recover",
+            "kdf-salt-init",
+        ] {
+            let err = CustodyCli::try_parse_from(["cred", "--custody", "127.0.0.1:1", verb])
+                .err()
+                .unwrap_or_else(|| panic!("`{verb}` must not parse under custody"));
+            assert!(
+                err.to_string().contains("unrecognized subcommand"),
+                "{verb}: {err}"
+            );
+        }
+        for ok in [
+            vec!["store", "svc", "key", "-t", "note"],
+            vec!["list"],
+            vec!["delete", "svc", "key", "-y"],
+            vec!["exec", "svc", "key", "--", "true"],
+            vec!["agent-key", "generate", "a", "--out", "/tmp/x.key"],
+            vec!["agent-key", "list"],
+            vec!["agent-key", "revoke", "a", "-y"],
+            vec!["ssh-ca", "sign", "-I", "id", "key.pub"],
+            vec!["ssh-ca", "mint", "--agent", "a"],
+            vec!["piv", "status"],
+        ] {
+            let mut args = vec!["cred", "--custody", "127.0.0.1:1"];
+            args.extend(ok.iter().copied());
+            assert!(
+                CustodyCli::try_parse_from(args.iter().copied()).is_ok(),
+                "{args:?}"
+            );
+        }
+    }
+
+    /// Local unlock flags produce one warning each under custody.
+    #[test]
+    fn ignored_flags_warn() {
+        assert!(ignored_local_flag_warnings(None, false, None).is_empty());
+        let warnings =
+            ignored_local_flag_warnings(Some("password"), true, Some(Path::new("/tmp/master.key")));
+        assert_eq!(warnings.len(), 3);
+        assert!(warnings[0].contains("--auth-mode"));
+        assert!(warnings[1].contains("--master-password"));
+        assert!(warnings[2].contains("--keyfile"));
+    }
+
+    /// The old credd GET /secret fallback is gone from the exec path.
+    #[test]
+    fn exec_has_no_network_fallback() {
+        let source = include_str!("cred.rs");
+        let needle = ["resolve", "_via_", "credd"].concat();
+        let hits = source.matches(needle.as_str()).count();
+        assert_eq!(hits, 0, "the removed credd fallback must not come back");
     }
 }

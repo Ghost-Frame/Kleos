@@ -208,6 +208,17 @@ pub fn guard_bearer_transport(url: &str) -> Result<(), EngError> {
     )))
 }
 
+/// Credential-daemon spelling of [`guard_bearer_transport`].
+///
+/// `kleos-cred` and the custody thin client share one transport rule: an agent
+/// or master bearer may only travel over https or to a loopback host. Keeping
+/// the name `guard_credd_transport` here lets `kleos-lib` and `kleos-cli`
+/// (which cannot depend on `kleos-cred`) call the same guard the `cred` binary
+/// uses, and `kleos_cred::net::guard_credd_transport` delegates to it.
+pub fn guard_credd_transport(url: &str) -> Result<(), EngError> {
+    guard_bearer_transport(url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

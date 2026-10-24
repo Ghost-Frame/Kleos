@@ -19,7 +19,7 @@ use kleos_credd::handlers::AppError;
 use crate::audit::{actions, log_phylax_audit};
 use crate::models::approval::{self, ApprovalStatus};
 use crate::models::ssh_settings;
-use crate::state::{PhylaxState, DEFAULT_APPROVAL_TTL_SECS};
+use crate::state::{approval_ttl_secs, PhylaxState};
 
 /// Error type for the pure signer.
 #[derive(Debug, thiserror::Error)]
@@ -118,13 +118,13 @@ pub async fn sign(
 
     if !auto_sign {
         let expires_at = (chrono::Utc::now()
-            + chrono::Duration::seconds(DEFAULT_APPROVAL_TTL_SECS))
+            + chrono::Duration::seconds(approval_ttl_secs(state.phone_approval_required)))
         .format("%Y-%m-%d %H:%M:%S")
         .to_string();
         // FIX 9: fall back to "master" -- without an agent name the caller used a
         // master token, and "master" is the convention used everywhere else.
         let agent_name = auth.agent_name().unwrap_or("master").to_string();
-        let ap = approval::create_approval(
+        let (ap, raw_token) = approval::create_approval_with_token(
             &state.inner.db,
             auth.user_id(),
             &agent_name,
@@ -135,6 +135,21 @@ pub async fn sign(
             &expires_at,
         )
         .await?;
+
+        if state.phone_approval_required {
+            let binding = approval::bind_phone_approval(&state.inner.db, &ap).await?;
+            crate::notify::notify_phone_approval(
+                ap.id,
+                "ssh-sign",
+                &agent_name,
+                &category,
+                &name,
+                &expires_at,
+                &raw_token,
+                &binding,
+            )
+            .await;
+        }
 
         // FIX 1: poll at most 25 iterations (25 < 30 = CREDD_REQUEST_TIMEOUT_SECS)
         // so the DENY path below fires before the global tower timeout would cancel

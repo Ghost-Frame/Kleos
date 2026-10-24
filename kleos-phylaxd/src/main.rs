@@ -4,6 +4,7 @@
 //! If no policies are configured, it behaves identically to plain credd.
 
 use clap::Parser;
+use kleos_credd::profile::RunProfile;
 use kleos_credd::server;
 use kleos_phylax::router::compose_router;
 use tracing::info;
@@ -55,9 +56,14 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
+    // PHYLAX_CUSTODY=1 (exactly) selects the custody profile; any other value
+    // warns and runs the legacy profile.
+    let profile = RunProfile::from_env();
+
     info!(
         listen = %args.listen,
         db_path = %args.db_path,
+        profile = ?profile,
         "starting phylaxd"
     );
 
@@ -67,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
         args.auth_mode.as_str(),
         args.master_password,
         args.keyfile,
+        profile,
         compose_router,
     )
     .await

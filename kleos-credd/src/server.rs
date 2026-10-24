@@ -12,6 +12,7 @@ use zeroize::Zeroizing;
 
 use crate::build_router;
 use crate::listener;
+use crate::profile::RunProfile;
 use crate::state::AppState;
 
 /// Build the master encryption key from credd auth-mode inputs.
@@ -96,6 +97,8 @@ fn resolve_db_encryption_key(enc_config: &Config) -> anyhow::Result<Option<[u8; 
             key.copy_from_slice(&derived[..]);
             Ok(Some(key))
         }
+        // Custody: slot 1 + /var/lib/phylax/challenge, no slot-2 fallback.
+        EncryptionMode::Custody => kleos_cred::encryption::resolve_at_rest_key(enc_config, None),
         _ => {
             let mode_name = format!("{:?}", enc_config.encryption.mode).to_ascii_lowercase();
             tracing::info!(mode = %mode_name, "resolving at-rest encryption key");
@@ -107,11 +110,15 @@ fn resolve_db_encryption_key(enc_config: &Config) -> anyhow::Result<Option<[u8; 
 }
 
 /// Build the runtime router from app state and serve through existing listeners.
+///
+/// `profile` is installed on the `AppState` before `build_router` runs, so the
+/// builder (and the auth middleware) see the same profile the listeners use.
 #[tracing::instrument(
     skip(master_key, bootstrap_master, file_agent_keys, encryption_key, build_router),
-    fields(listen = %listen, db_path = %db_path)
+    fields(listen = %listen, db_path = %db_path, profile = ?profile)
 )]
 // Run credd using a caller-provided router builder for composed daemons.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_with_router_builder<B>(
     listen: &str,
     db_path: &str,
@@ -119,6 +126,7 @@ pub async fn run_with_router_builder<B>(
     bootstrap_master: Option<Zeroizing<String>>,
     file_agent_keys: FileAgentKeyStore,
     encryption_key: Option<[u8; 32]>,
+    profile: RunProfile,
     build_router: B,
 ) -> anyhow::Result<()>
 where
@@ -128,7 +136,8 @@ where
     let db = Database::connect_encrypted(db_path, encryption_key).await?;
     db.write(|conn| run_migrations(conn)).await?;
 
-    let state = AppState::with_bootstrap(db, master_key, bootstrap_master, file_agent_keys);
+    let state = AppState::with_bootstrap(db, master_key, bootstrap_master, file_agent_keys)
+        .with_run_profile(profile);
     let app = build_router(state);
 
     // If neither CREDD_SOCKET nor CREDD_BIND is set, treat --listen as CREDD_BIND
@@ -137,14 +146,52 @@ where
         std::env::set_var("CREDD_BIND", listen);
     }
 
-    listener::serve(app).await
+    listener::serve_with_profile(app, profile).await
+}
+
+/// Resolve the TCP listen string the listeners will actually use.
+///
+/// Mirrors [`run_with_router_builder`] and `listener::serve`: an explicit
+/// `CREDD_BIND` wins; with neither `CREDD_SOCKET` nor `CREDD_BIND` set, `listen`
+/// is the bind; with only `CREDD_SOCKET` set there is no TCP listener.
+pub fn effective_tcp_bind(
+    listen: &str,
+    socket_env: Option<&str>,
+    bind_env: Option<&str>,
+) -> Option<String> {
+    match (socket_env, bind_env) {
+        (_, Some(bind)) => Some(bind.to_string()),
+        (None, None) => Some(listen.to_string()),
+        (Some(_), None) => None,
+    }
+}
+
+/// Run the custody startup checks for a daemon about to serve `listen` with the
+/// vault at `db_path`, with the process identity and listener env injected.
+#[cfg(unix)]
+pub fn custody_preflight_with(
+    ctx: &crate::custody::CustodyContext,
+    listen: &str,
+    db_path: &str,
+    socket_env: Option<&str>,
+    bind_env: Option<&str>,
+) -> Result<(), crate::custody::CustodyStartupError> {
+    let tcp_bind = effective_tcp_bind(listen, socket_env, bind_env);
+    crate::custody::preflight(ctx, std::path::Path::new(db_path), tcp_bind.as_deref())
 }
 
 /// Resolve startup inputs (auth mode + encryption mode) and run with a caller
 /// supplied router builder.
+///
+/// Under [`RunProfile::Custody`] the custody preflight (uid, bind address,
+/// vault file owner and mode) runs first, before any key material is touched,
+/// and a refusal is returned as a typed
+/// [`CustodyStartupError`](crate::custody::CustodyStartupError) inside the
+/// `anyhow::Error`. The vault encryption mode is forced to
+/// [`EncryptionMode::Custody`] regardless of env or the persisted marker.
 #[tracing::instrument(
     skip(master_password, keyfile, build_router),
-    fields(listen = %listen, db_path = %db_path, auth_mode = %auth_mode)
+    fields(listen = %listen, db_path = %db_path, auth_mode = %auth_mode, profile = ?profile)
 )]
 // Resolve environment-backed startup inputs before serving a composed router.
 pub async fn run_with_env<B>(
@@ -153,11 +200,68 @@ pub async fn run_with_env<B>(
     auth_mode: &str,
     master_password: Option<String>,
     keyfile: Option<PathBuf>,
+    profile: RunProfile,
     build_router: B,
 ) -> anyhow::Result<()>
 where
     B: FnOnce(AppState) -> Router,
 {
+    #[cfg(unix)]
+    let ctx = crate::custody::CustodyContext::current();
+    #[cfg(not(unix))]
+    let ctx = ();
+    run_with_env_as(
+        &ctx,
+        listen,
+        db_path,
+        auth_mode,
+        master_password,
+        keyfile,
+        profile,
+        build_router,
+    )
+    .await
+}
+
+/// Process identity handed to the custody preflight.
+#[cfg(unix)]
+pub type PreflightIdentity = crate::custody::CustodyContext;
+/// Placeholder identity on platforms without the custody preflight.
+#[cfg(not(unix))]
+pub type PreflightIdentity = ();
+
+/// [`run_with_env`] with the process identity injected, so tests can drive the
+/// real startup path as a different uid. Production code calls `run_with_env`.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_env_as<B>(
+    ctx: &PreflightIdentity,
+    listen: &str,
+    db_path: &str,
+    auth_mode: &str,
+    master_password: Option<String>,
+    keyfile: Option<PathBuf>,
+    profile: RunProfile,
+    build_router: B,
+) -> anyhow::Result<()>
+where
+    B: FnOnce(AppState) -> Router,
+{
+    if profile.is_custody() {
+        #[cfg(unix)]
+        custody_preflight_with(
+            ctx,
+            listen,
+            db_path,
+            std::env::var("CREDD_SOCKET").ok().as_deref(),
+            std::env::var("CREDD_BIND").ok().as_deref(),
+        )?;
+        #[cfg(not(unix))]
+        {
+            let _ = ctx;
+            anyhow::bail!("the custody profile requires a Unix platform");
+        }
+    }
+
     let master_key = resolve_master_key(auth_mode, master_password, keyfile)?;
     let mut enc_config = Config::from_env();
     // When ENGRAM_ENCRYPTION_MODE is not in the environment (the daemon was
@@ -170,11 +274,16 @@ where
             enc_config.encryption.mode = mode;
         }
     }
+    // Custody never trusts env or a persisted marker for the vault key source.
+    if profile.is_custody() {
+        enc_config.encryption.mode = EncryptionMode::Custody;
+    }
     let encryption_key = resolve_db_encryption_key(&enc_config)?;
     // Persist the resolved mode so a later restart without ENGRAM_ENCRYPTION_MODE
     // still opens the encrypted vault correctly instead of silently as plaintext.
-    // Mirrors the cred CLI. Best-effort.
-    if enc_config.encryption.mode != EncryptionMode::None {
+    // Mirrors the cred CLI. Best-effort. Custody does not persist: it has no
+    // home directory and always forces its own mode.
+    if !profile.is_custody() && enc_config.encryption.mode != EncryptionMode::None {
         if let Err(e) = kleos_cred::encryption::persist_encryption_mode(&enc_config.encryption.mode)
         {
             tracing::warn!(error = %e, "could not persist encryption-mode marker");
@@ -197,6 +306,7 @@ where
         bootstrap_master,
         file_agent_keys,
         encryption_key,
+        profile,
         build_router,
     )
     .await
@@ -237,6 +347,7 @@ pub async fn run(
         bootstrap_master,
         file_agent_keys,
         encryption_key,
+        RunProfile::Legacy,
         build_router,
     )
     .await

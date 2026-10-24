@@ -38,6 +38,21 @@ ignore = [
     # on every eframe/accesskit bump.
     { id = "RUSTSEC-2026-0194", reason = "quick-xml DoS; transitive via GUI AT-SPI (zbus_xml) only; local a11y XML not untrusted input; no safe upgrade" },
     { id = "RUSTSEC-2026-0195", reason = "quick-xml DoS; transitive via GUI AT-SPI (zbus_xml) only; local a11y XML not untrusted input; no safe upgrade" },
+    # zvariant, zbus_names, zvariant_derive: upstream declared unmaintained,
+    # no safe upgrade. Transitive only via the GUI D-Bus stack
+    # (eframe -> accesskit/atspi and rfd -> ashpd -> zbus). The server and CLI
+    # never reach it. Review on every eframe/accesskit/rfd bump.
+    { id = "RUSTSEC-2026-0370", reason = "zvariant unmaintained; transitive via GUI D-Bus stack only; no safe upgrade" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names unmaintained; transitive via GUI D-Bus stack only; no safe upgrade" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive unmaintained; transitive via GUI D-Bus stack only; no safe upgrade" },
+    # zip 2.4.2: three advisories, all in ZipArchive::extract and
+    # ZipStreamReader::extract (SUID bits, symlink targets, permissions through
+    # symlinks). kleos-lib only reads entries into memory for ingestion parsing
+    # and never calls either extract function. The fix is zip >= 9.0.0, a
+    # multi-major API migration tracked separately. Re-check on any new zip use.
+    { id = "RUSTSEC-2026-0367", reason = "zip extract SUID; kleos never calls extract; zip 9 migration tracked separately; reviewed 2026-10-23" },
+    { id = "RUSTSEC-2026-0368", reason = "zip extract symlink escape; kleos never calls extract; zip 9 migration tracked separately; reviewed 2026-10-23" },
+    { id = "RUSTSEC-2026-0369", reason = "zip extract permissions via symlink; kleos never calls extract; zip 9 migration tracked separately; reviewed 2026-10-23" },
 ]
 
 [licenses]
@@ -56,7 +71,6 @@ allow = [
     "MPL-2.0",
     "BSL-1.0",
     "0BSD",
-    "Elastic-2.0",
     "PolyForm-Noncommercial-1.0.0",
     "CDLA-Permissive-2.0",
     "OFL-1.1",
