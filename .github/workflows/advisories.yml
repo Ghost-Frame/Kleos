@@ -1,0 +1,40 @@
+name: Advisories
+
+# Re-check RustSec advisories against main on a schedule. New advisories are
+# published independently of any push, so without this a vulnerable lockfile
+# would only surface on the next unrelated PR.
+on:
+  schedule:
+    # Mondays 13:17 UTC, off the hour to avoid the scheduled-runner rush.
+    - cron: "17 13 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Keep in step with CARGO_DENY_VERSION in ci.yml.
+  CARGO_DENY_VERSION: 0.19.9
+
+jobs:
+  # Blocking advisories check on the default branch.
+  advisories:
+    runs-on: ubuntu-latest
+    steps:
+      # Pull the default branch.
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      # cargo-deny reads cargo metadata; pin the same toolchain as CI.
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@1.94.0
+
+      # Prebuilt release binary, same source as the CI deny job.
+      - name: Install cargo-deny
+        run: |
+          curl -LsSf "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+            | tar zx --strip-components=1 -C "$HOME/.cargo/bin" "cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl/cargo-deny"
+
+      # Fails the run when any unignored advisory applies to Cargo.lock.
+      - name: Check advisories
+        run: cargo deny check advisories

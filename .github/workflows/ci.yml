@@ -131,11 +131,19 @@ jobs:
         if: ${{ matrix.partition == 1 }}
         run: cargo test --doc --workspace --exclude kleos-migrate
 
+  # Supply-chain policy. Licenses, sources, and bans depend only on this
+  # repository, so they always block. Advisories also change when RustSec
+  # publishes, independent of any PR, so they block on main and on PRs that
+  # touch dependencies, and only warn elsewhere. advisories.yml re-checks main
+  # weekly so a new advisory surfaces even when nothing is pushed.
   deny:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
+        with:
+          # Full history so a PR can be diffed against its base branch.
+          fetch-depth: 0
 
       - name: Install Rust stable toolchain
         uses: dtolnay/rust-toolchain@1.94.0
@@ -147,10 +155,33 @@ jobs:
           curl -LsSf "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
             | tar zx --strip-components=1 -C "$HOME/.cargo/bin" "cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl/cargo-deny"
 
-      - name: Check licenses, sources, and advisories
+      - name: Check licenses, sources, and bans
         run: |
           if [ ! -f deny.toml ]; then
             echo "deny.toml missing -- CI policy requires it"
             exit 1
           fi
-          cargo deny check
+          cargo deny check bans licenses sources
+
+      - name: Check advisories
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          strict=1
+          if [ "$EVENT" = "pull_request" ]; then
+            # Default git pathspec wildcards cross directories, so
+            # '*Cargo.toml' covers the root and every member manifest.
+            changed="$(git diff --name-only "origin/${BASE_REF}...HEAD" -- Cargo.lock deny.toml '*Cargo.toml')"
+            if [ -z "$changed" ]; then
+              strict=0
+            else
+              echo "Dependency files changed; advisories are blocking:"
+              echo "$changed"
+            fi
+          fi
+          if [ "$strict" = 1 ]; then
+            cargo deny check advisories
+          elif ! cargo deny check advisories; then
+            echo "::warning title=New RustSec advisories::Advisories fail on dependencies this PR does not change. Fix them in a dependency PR; main and the weekly advisories workflow still block."
+          fi
