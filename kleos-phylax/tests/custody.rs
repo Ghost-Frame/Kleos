@@ -42,6 +42,8 @@ const RETAINED_UNDER_CUSTODY: &[&str] = &[
     "GET /secrets",
     "POST /secret/{category}/{*name}",
     "POST /resolve/proxy",
+    "POST /resolve/public",
+    "POST /custody/x509/rotate-leaf",
     "POST /resolve/sign",
     "POST /resolve/verify",
     "POST /resolve/exec",
@@ -49,6 +51,9 @@ const RETAINED_UNDER_CUSTODY: &[&str] = &[
     "POST /bootstrap/kleos-bearer",
     "POST /phylax/kleos/token",
 ];
+
+/// Routes that exist only under custody (they have no legacy counterpart).
+const CUSTODY_ONLY: &[&str] = &["POST /custody/x509/rotate-leaf"];
 
 /// SSH CA signer that refuses everything, so no test ever shells out.
 struct DenySigner;
@@ -295,9 +300,23 @@ fn route_enumeration_matches_profile() {
         );
     }
     // Custody only ever removes routes relative to legacy (POST /agents is
-    // present in both, served by a different handler).
+    // present in both, served by a different handler), apart from the listed
+    // custody-only routes, which legacy must not mount.
     for route in &custody {
-        assert!(legacy.contains(route), "{route} is custody-only");
+        if CUSTODY_ONLY.contains(&route.as_str()) {
+            assert!(
+                !legacy.contains(route),
+                "{route} must not be mounted under legacy"
+            );
+        } else {
+            assert!(legacy.contains(route), "{route} is custody-only");
+        }
+    }
+    for route in CUSTODY_ONLY {
+        assert!(
+            custody.iter().any(|r| r == route),
+            "{route} must be mounted under custody"
+        );
     }
 }
 

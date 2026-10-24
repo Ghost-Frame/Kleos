@@ -6,6 +6,7 @@ pub mod kleos_sync;
 pub mod resolve;
 pub mod secrets;
 pub mod types;
+pub mod x509;
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};

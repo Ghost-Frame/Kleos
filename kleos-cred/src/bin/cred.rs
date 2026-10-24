@@ -207,6 +207,19 @@ enum CustodyCommands {
         #[command(subcommand)]
         cmd: CustodyPivCmd,
     },
+    /// X.509 certificate operations performed by the daemon
+    X509 {
+        #[command(subcommand)]
+        cmd: CustodyX509Cmd,
+    },
+    /// Print the public half of a secret: the certificate (and chain) of an
+    /// x509 bundle, or the public key of an SSH key. Never a private key.
+    Public {
+        /// Service (category) name
+        category: String,
+        /// Secret name
+        name: String,
+    },
 }
 
 /// Agent key actions available in custody mode.
@@ -266,6 +279,28 @@ enum CustodySshCaCmd {
         /// Validity period (e.g. +1h, +30m, +5m).
         #[arg(long, default_value = "+1h")]
         ttl: String,
+    },
+}
+
+/// X.509 actions available in custody mode.
+#[derive(Subcommand)]
+enum CustodyX509Cmd {
+    /// Replace an x509 leaf bundle with a freshly issued one signed by a CA
+    /// bundle held on the daemon. Prints the JSON result, which contains only
+    /// public data (serial, expiry, certificate PEM, rollback name).
+    RotateLeaf {
+        /// CA bundle as CATEGORY/NAME
+        #[arg(long)]
+        ca: String,
+        /// Leaf bundle to replace as CATEGORY/NAME
+        #[arg(long)]
+        leaf: String,
+        /// Rotate only if the current leaf expires within this many days
+        #[arg(long)]
+        within_days: Option<u32>,
+        /// Lifetime of the new certificate in days (1-398, default 90)
+        #[arg(long)]
+        lifetime_days: Option<u32>,
     },
 }
 
@@ -1295,7 +1330,77 @@ async fn run_custody(cli: CustodyCli) -> Result<()> {
             let client = CustodyClient::from_target(&target()?)?;
             cmd_custody_ssh_ca(&client, cmd).await
         }
+        CustodyCommands::X509 { cmd } => {
+            let client = CustodyClient::from_target(&target()?)?;
+            cmd_custody_x509(&client, cmd).await
+        }
+        CustodyCommands::Public { category, name } => {
+            let client = CustodyClient::from_target(&target()?)?;
+            cmd_custody_public(&client, &category, &name).await
+        }
     }
+}
+
+/// Split a `CATEGORY/NAME` argument at its first `/`.
+///
+/// The name part may itself contain `/` (secret names nest); the category may
+/// not. A missing slash, an empty category or an empty name is an error that
+/// names the offending flag.
+fn parse_secret_ref<'a>(flag: &str, raw: &'a str) -> Result<(&'a str, &'a str)> {
+    let (category, name) = raw
+        .split_once('/')
+        .with_context(|| format!("{flag} must be CATEGORY/NAME, got `{raw}`"))?;
+    anyhow::ensure!(
+        !category.is_empty() && !name.is_empty(),
+        "{flag} must be CATEGORY/NAME with both parts non-empty, got `{raw}`"
+    );
+    Ok((category, name))
+}
+
+/// X.509 rotation performed by the daemon; prints the public JSON result.
+async fn cmd_custody_x509(client: &CustodyClient, cmd: CustodyX509Cmd) -> Result<()> {
+    match cmd {
+        CustodyX509Cmd::RotateLeaf {
+            ca,
+            leaf,
+            within_days,
+            lifetime_days,
+        } => {
+            let ca = parse_secret_ref("--ca", &ca)?;
+            let leaf = parse_secret_ref("--leaf", &leaf)?;
+            let rotated = client
+                .x509_rotate_leaf(ca, leaf, lifetime_days, within_days)
+                .await?;
+            let shown = serde_json::json!({
+                "rotated": rotated.rotated,
+                "serial_hex": rotated.serial_hex,
+                "not_after": rotated.not_after,
+                "certificate_pem": rotated.certificate_pem,
+                "rollback_name": rotated.rollback_name,
+            });
+            println!("{}", serde_json::to_string_pretty(&shown)?);
+            Ok(())
+        }
+    }
+}
+
+/// Print the public half the daemon returns for `category`/`name`.
+async fn cmd_custody_public(client: &CustodyClient, category: &str, name: &str) -> Result<()> {
+    let material = client.public_material(category, name).await?;
+    let mut printed = false;
+    for part in [
+        material.certificate_pem.as_deref(),
+        material.chain_pem.as_deref(),
+        material.public_key.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        println!("{}", part.trim_end());
+        printed = true;
+    }
+    anyhow::ensure!(printed, "{category}/{name} returned no public material");
+    Ok(())
 }
 
 /// Prompt for a secret locally and send it to the daemon; nothing is echoed back.
@@ -5005,8 +5110,10 @@ mod custody_thin_client_tests {
                 "exec",
                 "list",
                 "piv",
+                "public",
                 "ssh-ca",
-                "store"
+                "store",
+                "x509"
             ]
         );
     }
@@ -5045,6 +5152,27 @@ mod custody_thin_client_tests {
             vec!["ssh-ca", "sign", "-I", "id", "key.pub"],
             vec!["ssh-ca", "mint", "--agent", "a"],
             vec!["piv", "status"],
+            vec![
+                "x509",
+                "rotate-leaf",
+                "--ca",
+                "pki/ca",
+                "--leaf",
+                "pki/leaf",
+            ],
+            vec![
+                "x509",
+                "rotate-leaf",
+                "--ca",
+                "pki/ca",
+                "--leaf",
+                "pki/leaf",
+                "--within-days",
+                "30",
+                "--lifetime-days",
+                "90",
+            ],
+            vec!["public", "pki", "leaf"],
         ] {
             let mut args = vec!["cred", "--custody", "127.0.0.1:1"];
             args.extend(ok.iter().copied());
@@ -5052,6 +5180,20 @@ mod custody_thin_client_tests {
                 CustodyCli::try_parse_from(args.iter().copied()).is_ok(),
                 "{args:?}"
             );
+        }
+    }
+
+    /// `CATEGORY/NAME` splits at the first slash and rejects malformed input.
+    #[test]
+    fn secret_ref_parser_requires_category_and_name() {
+        assert_eq!(parse_secret_ref("--ca", "pki/ca").unwrap(), ("pki", "ca"));
+        assert_eq!(
+            parse_secret_ref("--ca", "pki/nested/ca").unwrap(),
+            ("pki", "nested/ca")
+        );
+        for bad in ["", "pki", "/ca", "pki/", "/"] {
+            let err = parse_secret_ref("--leaf", bad).unwrap_err().to_string();
+            assert!(err.contains("--leaf"), "{bad:?}: {err}");
         }
     }
 

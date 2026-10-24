@@ -203,6 +203,36 @@ pub struct MintedCertificate {
     pub cert_public_key: String,
 }
 
+/// Outcome of `POST /custody/x509/rotate-leaf`: public data only.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RotatedLeaf {
+    /// True when a new certificate was issued and stored.
+    pub rotated: bool,
+    /// Lowercase hex serial of the (new, or unchanged) leaf certificate.
+    pub serial_hex: String,
+    /// `notAfter` of that certificate, RFC 3339 UTC.
+    pub not_after: String,
+    /// PEM of that certificate (public material).
+    pub certificate_pem: String,
+    /// Name the previous material was kept under; `None` when nothing rotated.
+    pub rollback_name: Option<String>,
+}
+
+/// The public half of a secret from `POST /resolve/public`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicMaterial {
+    /// Type label of the secret, such as `x509_bundle` or `ssh_key`.
+    pub secret_type: String,
+    /// Leaf certificate PEM (bundles).
+    pub certificate_pem: Option<String>,
+    /// Intermediate chain PEM (bundles that carry one).
+    pub chain_pem: Option<String>,
+    /// OpenSSH public key (SSH keys).
+    pub public_key: Option<String>,
+}
+
 /// Wire wrapper of `GET /secrets`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -266,6 +296,39 @@ struct SshMintBody<'a> {
     principal: &'a str,
     /// Validity interval.
     ttl: &'a str,
+}
+
+/// One secret named in a rotation request.
+#[derive(Serialize)]
+struct SecretRefBody<'a> {
+    /// Category the secret lives in.
+    category: &'a str,
+    /// Secret name within the category.
+    name: &'a str,
+}
+
+/// Request body of `POST /custody/x509/rotate-leaf`.
+#[derive(Serialize)]
+struct RotateLeafBody<'a> {
+    /// CA bundle whose key signs the replacement.
+    ca: SecretRefBody<'a>,
+    /// Leaf bundle to replace.
+    leaf: SecretRefBody<'a>,
+    /// Lifetime of the new certificate in days.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lifetime_days: Option<u32>,
+    /// Rotate only when the current leaf expires within this many days.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rotate_within_days: Option<u32>,
+}
+
+/// Request body of `POST /resolve/public`.
+#[derive(Serialize)]
+struct PublicBody<'a> {
+    /// Category the secret lives in.
+    category: &'a str,
+    /// Secret name within the category.
+    name: &'a str,
 }
 
 /// Authenticated client for one custody daemon.
@@ -687,6 +750,78 @@ impl CustodyClient {
             .await?;
         decode(&bytes)
     }
+
+    /// Rotate the x509 `leaf` (category, name) under the vault-held `ca`
+    /// (category, name). With `within_days` set the daemon rotates only when
+    /// the current certificate expires inside that window and otherwise
+    /// reports it unchanged. The response holds public data only.
+    pub async fn x509_rotate_leaf(
+        &self,
+        ca: (&str, &str),
+        leaf: (&str, &str),
+        lifetime_days: Option<u32>,
+        within_days: Option<u32>,
+    ) -> Result<RotatedLeaf> {
+        for (what, part) in [("ca category", ca.0), ("leaf category", leaf.0)] {
+            if part.contains('/') {
+                return Err(CustodyError::InvalidInput(format!(
+                    "{what} must not contain `/`"
+                )));
+            }
+        }
+        for (what, part) in [
+            ("ca category", ca.0),
+            ("ca name", ca.1),
+            ("leaf category", leaf.0),
+            ("leaf name", leaf.1),
+        ] {
+            check_segment(what, part)?;
+        }
+        let bytes = self
+            .send(
+                Method::POST,
+                &["custody", "x509", "rotate-leaf"],
+                &[],
+                Some(&RotateLeafBody {
+                    ca: SecretRefBody {
+                        category: ca.0,
+                        name: ca.1,
+                    },
+                    leaf: SecretRefBody {
+                        category: leaf.0,
+                        name: leaf.1,
+                    },
+                    lifetime_days,
+                    rotate_within_days: within_days,
+                }),
+                REQUEST_TIMEOUT,
+            )
+            .await?;
+        decode(&bytes)
+    }
+
+    /// Fetch the public half of a secret: the certificate and chain of an x509
+    /// bundle, or the public key of an SSH key. The daemon refuses every other
+    /// type, so no private material can arrive through this call.
+    pub async fn public_material(&self, category: &str, name: &str) -> Result<PublicMaterial> {
+        if category.contains('/') {
+            return Err(CustodyError::InvalidInput(
+                "category must not contain `/`".into(),
+            ));
+        }
+        check_segment("category", category)?;
+        check_segment("name", name)?;
+        let bytes = self
+            .send(
+                Method::POST,
+                &["resolve", "public"],
+                &[],
+                Some(&PublicBody { category, name }),
+                REQUEST_TIMEOUT,
+            )
+            .await?;
+        decode(&bytes)
+    }
 }
 
 /// Unit tests for target parsing, key loading and response decoding.
@@ -855,5 +990,62 @@ mod tests {
         assert!(msg.chars().count() <= MAX_ERROR_MESSAGE_CHARS);
         assert!(!msg.contains('\n'));
         assert_eq!(refusal_message(b"not json"), "");
+    }
+
+    /// Rotation and public-material responses decode, and a rogue extra field
+    /// (such as a key) is rejected without being echoed.
+    #[test]
+    fn x509_responses_deny_unknown_fields() {
+        let ok = br#"{"rotated":true,"serial_hex":"ab","not_after":"2027-01-01T00:00:00Z","certificate_pem":"C","rollback_name":"leaf-rollback-ab"}"#;
+        let rotated = decode::<RotatedLeaf>(ok).unwrap();
+        assert!(rotated.rotated);
+        assert_eq!(rotated.rollback_name.as_deref(), Some("leaf-rollback-ab"));
+        let unchanged = br#"{"rotated":false,"serial_hex":"ab","not_after":"x","certificate_pem":"C","rollback_name":null}"#;
+        assert_eq!(
+            decode::<RotatedLeaf>(unchanged).unwrap().rollback_name,
+            None
+        );
+        let rogue = br#"{"rotated":true,"serial_hex":"ab","not_after":"x","certificate_pem":"C","rollback_name":null,"private_key_pem":"TOPSECRETKEY"}"#;
+        let err = decode::<RotatedLeaf>(rogue).unwrap_err();
+        assert!(!err.to_string().contains("TOPSECRETKEY"), "{err}");
+
+        let public = br#"{"secret_type":"ssh_key","certificate_pem":null,"chain_pem":null,"public_key":"ssh-ed25519 AAAA"}"#;
+        assert_eq!(
+            decode::<PublicMaterial>(public)
+                .unwrap()
+                .public_key
+                .as_deref(),
+            Some("ssh-ed25519 AAAA")
+        );
+        let rogue = br#"{"secret_type":"x","certificate_pem":null,"chain_pem":null,"public_key":null,"private_key":"TOPSECRETKEY"}"#;
+        assert!(decode::<PublicMaterial>(rogue).is_err());
+    }
+
+    /// Rotation arguments that could escape their route are refused before
+    /// any request is made.
+    #[tokio::test]
+    async fn x509_calls_refuse_unsafe_arguments() {
+        let client =
+            CustodyClient::with_token("127.0.0.1:1", Zeroizing::new("bearer".into())).unwrap();
+        assert!(matches!(
+            client
+                .x509_rotate_leaf(("a/b", "ca"), ("pki", "leaf"), None, None)
+                .await,
+            Err(CustodyError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            client
+                .x509_rotate_leaf(("pki", "ca"), ("pki", ".."), None, None)
+                .await,
+            Err(CustodyError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            client.public_material("pki", "").await,
+            Err(CustodyError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            client.public_material("a/b", "n").await,
+            Err(CustodyError::InvalidInput(_))
+        ));
     }
 }
