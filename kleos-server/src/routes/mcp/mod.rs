@@ -19,10 +19,33 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 
 use crate::extractors::Auth;
+use crate::middleware::audit::{dispatch_audit_event, AuditEvent};
 use crate::state::AppState;
 
 /// MCP protocol version this endpoint speaks.
 const PROTOCOL_VERSION: &str = "2025-03-26";
+
+/// Guidance returned in the `initialize` response. Clients inject it into the
+/// model's context for every conversation on the connector, so it is the one
+/// channel that reaches a user who cannot run client-side hooks.
+const MCP_INSTRUCTIONS: &str = "Kleos is this person's persistent memory across conversations. \
+SEARCH FIRST: before answering anything that depends on a person, job, customer, vendor, \
+price, past decision, or earlier conversation, call memory_search; try a second phrasing \
+if the first is thin. STORE WITHOUT BEING ASKED: when a durable fact, decision, number, or \
+next step appears, call memory_store in the same turn, one memory per fact, and show one \
+line: Saved: <short summary>. Store immediately when they say remember this. Never store \
+passwords, secrets, or throwaway chatter. Memory read results end with a reminder; act on \
+it before the conversation ends.";
+
+/// Trailing line appended to the text content of successful memory read
+/// results, so every turn that consults Kleos also reminds the model to store.
+/// `structuredContent` is never touched.
+const STORE_NUDGE: &str = "Kleos reminder: if this turn produced a decision, a fact about a \
+person or job, a number that matters, or a next step, store each one with memory_store \
+before you finish.";
+
+/// Byte cap on the search-text preview written to the audit trail.
+const QUERY_PREVIEW_MAX_BYTES: usize = 80;
 
 /// Maximum number of JSON-RPC requests allowed in a single batch.
 /// Prevents rate-limit bypass via fan-out and bounds response memory.
@@ -129,13 +152,14 @@ async fn handle_single_rpc(
                 json!({
                     "protocolVersion": PROTOCOL_VERSION,
                     "capabilities": {
-                        "tools": {}
+                        "tools": {},
+                        "prompts": {}
                     },
                     "serverInfo": {
                         "name": "kleos",
                         "version": env!("CARGO_PKG_VERSION")
                     },
-                    "instructions": "Kleos memory system. Use memory_search or memory_store for core operations. Use context_build for assembled context."
+                    "instructions": MCP_INSTRUCTIONS
                 }),
             ))
         }
@@ -148,6 +172,25 @@ async fn handle_single_rpc(
             let id = id?;
             Some(rpc_ok(id, json!({ "tools": kleos_mcp::tools::registry() })))
         }
+        "prompts/list" => {
+            let id = id?;
+            Some(rpc_ok(id, json!({ "prompts": prompt_catalog() })))
+        }
+        "prompts/get" => {
+            let id = id?;
+            let name = params
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let arguments = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            match prompt_messages(name, &arguments) {
+                Some(result) => Some(rpc_ok(id, result)),
+                None => Some(rpc_error(id, -32602, "Unknown prompt")),
+            }
+        }
         "tools/call" => {
             let id = id?;
             let name = params
@@ -159,6 +202,7 @@ async fn handle_single_rpc(
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
+            let query_preview = search_query_preview(&name, &arguments);
 
             // Charge per-tool rate-limit tokens before dispatch.
             if let Some(route) = resolve_tool_name(&name) {
@@ -177,6 +221,7 @@ async fn handle_single_rpc(
                 {
                     Ok(true) => {}
                     Ok(false) => {
+                        record_tool_audit(state, auth, &name, 429, query_preview).await;
                         return Some(rpc_ok(
                             id,
                             json!({
@@ -187,6 +232,7 @@ async fn handle_single_rpc(
                     }
                     Err(e) => {
                         tracing::error!(tool = %name, error = %e, "rate-limit check failed during MCP dispatch");
+                        record_tool_audit(state, auth, &name, 503, query_preview).await;
                         return Some(rpc_ok(
                             id,
                             json!({
@@ -198,23 +244,33 @@ async fn handle_single_rpc(
                 }
             }
 
-            match dispatch_tool(dispatch, auth, &name, arguments).await {
-                Ok(value) => Some(rpc_ok(
+            let outcome = dispatch_tool(dispatch, auth, &name, arguments).await;
+            let status = match &outcome {
+                Ok(_) => 200,
+                Err(failure) => failure.status,
+            };
+            record_tool_audit(state, auth, &name, status, query_preview).await;
+
+            match outcome {
+                Ok(value) => {
+                    let text =
+                        serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
+                    Some(rpc_ok(
+                        id,
+                        json!({
+                            "content": [{
+                                "type": "text",
+                                "text": with_store_nudge(&name, text)
+                            }],
+                            "structuredContent": value,
+                            "isError": false
+                        }),
+                    ))
+                }
+                Err(failure) => Some(rpc_ok(
                     id,
                     json!({
-                        "content": [{
-                            "type": "text",
-                            "text": serde_json::to_string_pretty(&value)
-                                .unwrap_or_else(|_| value.to_string())
-                        }],
-                        "structuredContent": value,
-                        "isError": false
-                    }),
-                )),
-                Err(message) => Some(rpc_ok(
-                    id,
-                    json!({
-                        "content": [{ "type": "text", "text": message }],
+                        "content": [{ "type": "text", "text": failure.message }],
                         "isError": true
                     }),
                 )),
@@ -222,6 +278,161 @@ async fn handle_single_rpc(
         }
         _ => id.map(|id| rpc_error(id, -32601, "Method not found")),
     }
+}
+
+/// Why a tool call did not produce a successful result, with the HTTP-style
+/// status the audit trail records for it. Pre-dispatch refusals use synthetic
+/// codes (403 blocked or out of scope, 404 unknown tool, 400 bad arguments);
+/// dispatched calls carry the handler's own status.
+struct DispatchFailure {
+    /// Status recorded in the `mcp.tool` audit row.
+    status: u16,
+    /// Client-safe message returned in the tool result.
+    message: String,
+}
+
+/// Constructors for dispatch failures.
+impl DispatchFailure {
+    /// Pairs a status code with its client-facing message.
+    fn new(status: u16, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+}
+
+/// Queues one `mcp.tool` audit row for a `tools/call`, attributed to the
+/// caller the same way the outer HTTP row is. Best-effort and non-blocking,
+/// exactly like HTTP audit.
+async fn record_tool_audit(
+    state: &AppState,
+    auth: &AuthContext,
+    tool: &str,
+    status: u16,
+    query_preview: Option<String>,
+) {
+    let (identity_id, tier) = auth
+        .identity
+        .as_ref()
+        .map(|id| (id.identity_id, Some(id.tier.as_str().to_string())))
+        .unwrap_or((None, None));
+    dispatch_audit_event(
+        &state.db,
+        &state.audit_tx,
+        AuditEvent {
+            user_id: Some(auth.user_id),
+            agent_id: auth.key.agent_id,
+            identity_id,
+            tier,
+            method: "POST".to_string(),
+            path: "/mcp".to_string(),
+            status,
+            ip: None,
+            tool: Some(tool.to_string()),
+            query_preview,
+        },
+    )
+    .await;
+}
+
+/// Bounded, single-line preview of the search text for memory search tools,
+/// written to the audit row so the trail shows what a person was looking for.
+/// `None` for every other tool or when no usable query was supplied.
+fn search_query_preview(tool: &str, args: &Value) -> Option<String> {
+    let route = resolve_tool_name(tool)?;
+    if !route.name.starts_with("memory.search") {
+        return None;
+    }
+    let query = args.get("query").and_then(Value::as_str)?.trim();
+    if query.is_empty() {
+        return None;
+    }
+    let preview = kleos_lib::validation::truncate_on_char_boundary(query, QUERY_PREVIEW_MAX_BYTES);
+    Some(preview.replace(['\n', '\r'], " "))
+}
+
+/// True when the tool is a read-only memory tool (search, list, recall, get),
+/// the calls after which a store reminder is useful.
+fn is_memory_read_tool(tool: &str) -> bool {
+    resolve_tool_name(tool)
+        .map(|route| route.name.starts_with("memory.") && route.scope == RouteScope::Read)
+        .unwrap_or(false)
+}
+
+/// Appends the store reminder to the text content of a memory read result.
+/// Any other tool's text is returned unchanged.
+fn with_store_nudge(tool: &str, text: String) -> String {
+    if !is_memory_read_tool(tool) {
+        return text;
+    }
+    format!("{text}\n\n{STORE_NUDGE}")
+}
+
+/// Prompts advertised through `prompts/list`: a one-tap recall briefing and a
+/// one-tap wrap-up, for clients that surface server prompts to the user.
+fn prompt_catalog() -> Value {
+    json!([
+        {
+            "name": "catch_up",
+            "description": "Search Kleos memory for a topic and give a short briefing of what is known, what was decided, and what is still open.",
+            "arguments": [
+                {
+                    "name": "topic",
+                    "description": "The customer, job, person, or subject you are about to work on.",
+                    "required": false
+                }
+            ]
+        },
+        {
+            "name": "wrap_up",
+            "description": "Store every durable fact, decision, number, and next step from this conversation in Kleos memory, then list what was saved.",
+            "arguments": []
+        }
+    ])
+}
+
+/// Builds the `prompts/get` result for a named prompt, or `None` when the
+/// prompt is unknown. A missing or non-string `topic` falls back to generic
+/// wording rather than an error.
+fn prompt_messages(name: &str, args: &Value) -> Option<Value> {
+    let text = match name {
+        "catch_up" => {
+            let topic = args
+                .get("topic")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|topic| !topic.is_empty());
+            match topic {
+                Some(topic) => format!(
+                    "Search Kleos memory for everything known about \"{topic}\" using memory_search; \
+                     try a second phrasing if the first result is thin. Then give me a short briefing: \
+                     what is known, what decisions were made and why, and what is still open."
+                ),
+                None => "Ask me what I am about to work on, then search Kleos memory for it using \
+                         memory_search and give me a short briefing: what is known, what decisions \
+                         were made and why, and what is still open."
+                    .to_string(),
+            }
+        }
+        "wrap_up" => "Review this conversation and store each durable fact, decision, number that \
+                      matters, and next step as its own memory with memory_store. Skip throwaway \
+                      chatter, anything uncertain, and any password or secret. Then list what you \
+                      saved, one line each."
+            .to_string(),
+        _ => return None,
+    };
+    Some(json!({
+        "description": prompt_catalog()
+            .as_array()
+            .and_then(|prompts| prompts.iter().find(|p| p["name"] == name))
+            .and_then(|p| p["description"].as_str())
+            .unwrap_or_default(),
+        "messages": [{
+            "role": "user",
+            "content": { "type": "text", "text": text }
+        }]
+    }))
 }
 
 /// Builds a client-safe error message for a failed internal dispatch.
@@ -311,16 +522,20 @@ async fn dispatch_tool(
     auth: &AuthContext,
     name: &str,
     mut args: Value,
-) -> Result<Value, String> {
+) -> Result<Value, DispatchFailure> {
     // Secret-bearing routes (cred resolve/proxy) are dispatchable by name even
     // though tools/list omits them. Refuse them so a raw credential never lands
     // in the MCP response's structuredContent / text and, from there, in model
     // transcripts and logs.
     if kleos_client::is_mcp_blocked(name) {
-        return Err(format!("tool '{name}' is not available over MCP"));
+        return Err(DispatchFailure::new(
+            403,
+            format!("tool '{name}' is not available over MCP"),
+        ));
     }
 
-    let route = resolve_tool_name(name).ok_or_else(|| format!("unknown tool: {name}"))?;
+    let route = resolve_tool_name(name)
+        .ok_or_else(|| DispatchFailure::new(404, format!("unknown tool: {name}")))?;
 
     // Record the required scope in the span.
     tracing::Span::current().record(
@@ -331,9 +546,12 @@ async fn dispatch_tool(
     // Enforce scope before dispatch.
     let required = route_scope_to_auth_scope(route.scope);
     if !auth.has_scope(&required) {
-        return Err(format!(
-            "insufficient scope: tool '{}' requires {:?}",
-            name, required
+        return Err(DispatchFailure::new(
+            403,
+            format!(
+                "insufficient scope: tool '{}' requires {:?}",
+                name, required
+            ),
         ));
     }
 
@@ -341,18 +559,21 @@ async fn dispatch_tool(
     // access must be checked against each actual tool before internal dispatch.
     if auth.act_as.is_some() {
         let required_access = route_scope_to_instance_access(route.scope);
-        let delegated = auth
-            .act_as_access
-            .ok_or_else(|| "delegated MCP request is missing its grant context".to_string())?;
+        let delegated = auth.act_as_access.ok_or_else(|| {
+            DispatchFailure::new(403, "delegated MCP request is missing its grant context")
+        })?;
         if !delegated.satisfies(required_access) {
-            return Err(format!(
-                "insufficient delegated access: tool '{name}' requires {}",
-                required_access.as_str()
+            return Err(DispatchFailure::new(
+                403,
+                format!(
+                    "insufficient delegated access: tool '{name}' requires {}",
+                    required_access.as_str()
+                ),
             ));
         }
     }
 
-    let path = render_path(route.path, &mut args)?;
+    let path = render_path(route.path, &mut args).map_err(|e| DispatchFailure::new(400, e))?;
 
     // Build URI: for GET/DELETE, remaining args become query parameters.
     let uri = match route.method {
@@ -385,7 +606,7 @@ async fn dispatch_tool(
 
     let mut request = builder
         .body(body)
-        .map_err(|e| format!("failed to build internal request: {e}"))?;
+        .map_err(|e| DispatchFailure::new(500, format!("failed to build internal request: {e}")))?;
 
     // Inject pre-validated AuthContext so handler extractors find it.
     request.extensions_mut().insert(auth.clone());
@@ -395,13 +616,13 @@ async fn dispatch_tool(
         .clone()
         .oneshot(request)
         .await
-        .map_err(|e| format!("internal dispatch failed: {e}"))?;
+        .map_err(|e| DispatchFailure::new(502, format!("internal dispatch failed: {e}")))?;
 
     let status = response.status();
     tracing::Span::current().record("mcp.status", status.as_u16() as i64);
     let body_bytes = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
         .await
-        .map_err(|e| format!("failed to read internal response: {e}"))?;
+        .map_err(|e| DispatchFailure::new(502, format!("failed to read internal response: {e}")))?;
 
     let parsed: Result<Value, _> = serde_json::from_slice(&body_bytes);
     if status.is_success() {
@@ -410,9 +631,12 @@ async fn dispatch_tool(
                 .as_ref()
                 .map(Value::to_string)
                 .unwrap_or_else(|_| String::from_utf8_lossy(&body_bytes).into_owned());
-            return Err(format!(
-                "tool '{}' returned a partial result requiring caller recovery: {}",
-                name, body
+            return Err(DispatchFailure::new(
+                status.as_u16(),
+                format!(
+                    "tool '{}' returned a partial result requiring caller recovery: {}",
+                    name, body
+                ),
             ));
         }
         if let Some(body) = parsed
@@ -420,9 +644,12 @@ async fn dispatch_tool(
             .ok()
             .filter(|body| body.get("attachments_committed") == Some(&Value::Bool(false)))
         {
-            return Err(format!(
-                "tool '{}' partially persisted its memory but did not commit attachments: {}",
-                name, body
+            return Err(DispatchFailure::new(
+                StatusCode::MULTI_STATUS.as_u16(),
+                format!(
+                    "tool '{}' partially persisted its memory but did not commit attachments: {}",
+                    name, body
+                ),
             ));
         }
         parsed.or_else(|_| {
@@ -451,10 +678,9 @@ async fn dispatch_tool(
                     s.into_owned()
                 }
             });
-        Err(sanitize_dispatch_error(
-            name,
+        Err(DispatchFailure::new(
             status.as_u16(),
-            &internal_msg,
+            sanitize_dispatch_error(name, status.as_u16(), &internal_msg),
         ))
     }
 }
@@ -742,5 +968,111 @@ mod tests {
         let preview = preview_utf8(&text, 512);
         assert!(preview.len() <= 512);
         assert!(text.starts_with(&preview));
+    }
+
+    /// The initialize guidance states the protocol and stays short enough
+    /// that clients inject it without truncation.
+    #[test]
+    fn instructions_state_protocol_and_stay_bounded() {
+        assert!(MCP_INSTRUCTIONS.contains("memory_search"));
+        assert!(MCP_INSTRUCTIONS.contains("memory_store"));
+        assert!(MCP_INSTRUCTIONS.contains("remember this"));
+        assert!(
+            MCP_INSTRUCTIONS.len() < 900,
+            "len {}",
+            MCP_INSTRUCTIONS.len()
+        );
+    }
+
+    /// Memory read tools get the store reminder in their text; write tools
+    /// and non-memory tools do not.
+    #[test]
+    fn store_nudge_only_follows_memory_reads() {
+        let nudged = with_store_nudge("memory_search", "{}".to_string());
+        assert!(nudged.starts_with("{}\n\n"));
+        assert!(nudged.ends_with(STORE_NUDGE));
+        assert_eq!(
+            with_store_nudge("memory_recall", "r".to_string()),
+            format!("r\n\n{STORE_NUDGE}")
+        );
+        assert_eq!(with_store_nudge("memory_store", "{}".to_string()), "{}");
+        assert_eq!(with_store_nudge("tasks_list", "[]".to_string()), "[]");
+        assert_eq!(with_store_nudge("no_such_tool", "x".to_string()), "x");
+    }
+
+    /// Search previews are bounded, single-line, multibyte safe, and absent
+    /// for non-search tools or empty queries.
+    #[test]
+    fn search_query_preview_is_bounded_and_scoped() {
+        let long = "é".repeat(100);
+        let preview = search_query_preview("memory_search", &json!({ "query": long })).unwrap();
+        assert!(preview.len() <= QUERY_PREVIEW_MAX_BYTES);
+        assert!(preview.chars().all(|c| c == 'é'));
+
+        let multiline =
+            search_query_preview("memory_search", &json!({ "query": "a\nb\r\nc" })).unwrap();
+        assert_eq!(multiline, "a b  c");
+
+        assert_eq!(
+            search_query_preview("memory_search", &json!({ "query": "   " })),
+            None
+        );
+        assert_eq!(
+            search_query_preview("memory_search", &json!({ "query": 5 })),
+            None
+        );
+        assert_eq!(
+            search_query_preview("memory_store", &json!({ "query": "x" })),
+            None
+        );
+        assert_eq!(
+            search_query_preview("memory_list", &json!({ "query": "x" })),
+            None
+        );
+    }
+
+    /// Both prompts are advertised, resolvable, and tolerant of missing
+    /// arguments; unknown names resolve to nothing.
+    #[test]
+    fn prompts_are_listed_and_resolvable() {
+        let catalog = prompt_catalog();
+        let names: Vec<&str> = catalog
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["catch_up", "wrap_up"]);
+
+        let with_topic = prompt_messages("catch_up", &json!({ "topic": " Smith job " })).unwrap();
+        let text = with_topic["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(text.contains("\"Smith job\""));
+        assert!(text.contains("memory_search"));
+        assert_eq!(with_topic["messages"][0]["role"], "user");
+        assert!(!with_topic["description"].as_str().unwrap().is_empty());
+
+        let without_topic = prompt_messages("catch_up", &json!({ "topic": 42 })).unwrap();
+        let text = without_topic["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(text.starts_with("Ask me what I am about to work on"));
+
+        let wrap = prompt_messages("wrap_up", &json!({})).unwrap();
+        assert!(wrap["messages"][0]["content"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("memory_store"));
+
+        assert!(prompt_messages("nope", &json!({})).is_none());
+    }
+
+    /// Pre-dispatch failures carry the synthetic status the audit row records.
+    #[test]
+    fn dispatch_failure_pairs_status_with_message() {
+        let failure = DispatchFailure::new(404, format!("unknown tool: {}", "x"));
+        assert_eq!(failure.status, 404);
+        assert_eq!(failure.message, "unknown tool: x");
     }
 }

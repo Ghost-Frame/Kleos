@@ -35,6 +35,15 @@ pub struct AuditEvent {
     pub status: u16,
     /// Trusted-proxy-resolved client IP, if determinable.
     pub ip: Option<String>,
+    /// MCP tool name when this event records one `tools/call` inside a
+    /// `POST /mcp` request rather than the outer HTTP request itself. The
+    /// worker writes such events as `mcp.tool` rows so per-tool counts are
+    /// queryable even though every MCP call shares the same HTTP path.
+    pub tool: Option<String>,
+    /// Bounded preview of the search text for memory search tools, so the
+    /// audit trail shows what a person was looking for, not just that they
+    /// looked. Empty for every other tool.
+    pub query_preview: Option<String>,
 }
 
 /// Spawn the dedicated audit-log worker and return the sender half.
@@ -77,14 +86,29 @@ pub fn spawn_audit_worker(
 /// Write a single audit event to the audit trail; failures are logged, never
 /// propagated (audit is best-effort by design).
 async fn write_audit_event(db: &Database, ev: AuditEvent) {
-    let action = format!("http.{}", ev.method.to_lowercase());
-    let details = format!("path={} status={}", ev.path, ev.status);
+    // An MCP tool call is recorded by tool name; the outer transport request
+    // already produced its own `http.post path=/mcp` row.
+    let (action, target_type, details) = match &ev.tool {
+        Some(tool) => {
+            let mut details = format!("tool={} status={}", tool, ev.status);
+            if let Some(query) = &ev.query_preview {
+                details.push_str(" query=");
+                details.push_str(query);
+            }
+            ("mcp.tool".to_string(), "mcp", details)
+        }
+        None => (
+            format!("http.{}", ev.method.to_lowercase()),
+            "http",
+            format!("path={} status={}", ev.path, ev.status),
+        ),
+    };
     if let Err(e) = kleos_lib::audit::log_request(
         db,
         ev.user_id,
         ev.agent_id,
         &action,
-        Some("http"),
+        Some(target_type),
         None,
         Some(&details),
         ev.ip.as_deref(),
@@ -99,7 +123,7 @@ async fn write_audit_event(db: &Database, ev: AuditEvent) {
 }
 
 /// Delivers an audit event without losing it if the background receiver has closed.
-async fn dispatch_audit_event(
+pub(crate) async fn dispatch_audit_event(
     db: &Database,
     audit_tx: &tokio::sync::mpsc::Sender<AuditEvent>,
     event: AuditEvent,
@@ -172,6 +196,8 @@ pub async fn audit_middleware(
             path,
             status,
             ip,
+            tool: None,
+            query_preview: None,
         },
     )
     .await;
@@ -203,6 +229,8 @@ mod tests {
                 path: "/store".to_string(),
                 status: 200,
                 ip: Some("127.0.0.1".to_string()),
+                tool: None,
+                query_preview: None,
             },
         )
         .await;
@@ -212,6 +240,47 @@ mod tests {
                 Ok(conn.query_row(
                     "SELECT COUNT(*) FROM audit_log WHERE user_id = 42
                      AND action = 'http.post' AND details = 'path=/store status=200'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    /// Verifies that an MCP tool-call event is written as an `mcp.tool` row
+    /// carrying the tool name, status, and search preview.
+    #[tokio::test]
+    async fn mcp_tool_event_is_written_by_tool_name() {
+        let db = Database::connect_memory().await.unwrap();
+        let (audit_tx, mut audit_rx) = tokio::sync::mpsc::channel(1);
+        audit_rx.close();
+
+        dispatch_audit_event(
+            &db,
+            &audit_tx,
+            AuditEvent {
+                user_id: Some(7),
+                agent_id: None,
+                identity_id: None,
+                tier: None,
+                method: "POST".to_string(),
+                path: "/mcp".to_string(),
+                status: 200,
+                ip: None,
+                tool: Some("memory_search".to_string()),
+                query_preview: Some("vendor pricing".to_string()),
+            },
+        )
+        .await;
+
+        let count = db
+            .read(|conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM audit_log WHERE user_id = 7
+                     AND action = 'mcp.tool' AND target_type = 'mcp'
+                     AND details = 'tool=memory_search status=200 query=vendor pricing'",
                     [],
                     |row| row.get::<_, i64>(0),
                 )?)
