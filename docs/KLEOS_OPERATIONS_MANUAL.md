@@ -157,6 +157,26 @@ Use for:
 
 - Fetches `GET /health`.
 
+#### `kleos-cli doctor [--json] [--dir PATH]`
+
+- Diagnoses the client installation and server access in one pass. Every
+  check reports `ok`, `warn`, `fail`, or `skip`, with a suggested manual fix
+  where one applies. Nothing is repaired automatically.
+- Local checks: `binary` (version, and whether `PATH` resolves `kleos-cli`
+  to a different file), `url` (every entry of the `KLEOS_URL` failover list;
+  plaintext HTTP to a public, non-loopback host warns), `project`
+  (the identity `--dir` resolves to, and whether `SESSION_HANDOFF_PROJECT`
+  overrides it), `mcp_registration` (Claude Code `~/.claude.json` plus every
+  ancestor `.mcp.json`, and Codex `~/.codex/config.toml`), `hooks` (Claude
+  Code hooks mentioning kleos whose executable path is missing).
+- Server checks: `reachability` (`GET /health`), `version_compat` (CLI
+  versus server `major.minor`), `auth` (one authenticated `GET /list?limit=1`).
+  They are skipped when the server is unreachable.
+- Exits `1` if any check fails, otherwise `0`. `--json` emits the full report.
+- Never prints credential values, MCP commands, or headers. The only possible
+  side effect is the standard client session-token cache, which the `auth`
+  probe may refresh or clear exactly like any other authenticated command.
+
 #### `kleos-cli activity --action ACT --summary TEXT [--project P] [--agent A] [--metadata JSON]`
 
 - Posts a lifecycle event to `POST /activity`.
