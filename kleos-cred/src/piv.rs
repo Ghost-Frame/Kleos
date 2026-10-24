@@ -121,35 +121,42 @@ fn piv_pin() -> String {
     std::env::var("YKMAN_PIN").unwrap_or_else(|_| DEFAULT_PIN.to_string())
 }
 
-/// Run a ykman command. If `YKMAN_MGMT_KEY` is set, pass it via
-/// `--management-key`; otherwise pipe a blank line to stdin so ykman
-/// uses its factory-default management key. `extra_path` is appended
-/// after the management-key args (used for output PEM paths).
+/// Line written to ykman's stdin to answer its management-key prompt.
+///
+/// `Some(key)` supplies the operator's management key; `None` sends a blank
+/// line, which ykman reads as "use the factory-default management key". The
+/// key goes through stdin, never `--management-key`, so it cannot appear in
+/// `ps`, `/proc/<pid>/cmdline` or shell audit logs.
+fn mgmt_key_stdin_line(management_key: Option<&str>) -> zeroize::Zeroizing<String> {
+    zeroize::Zeroizing::new(format!("{}\n", management_key.unwrap_or("")))
+}
+
+/// Run a ykman command, answering its management-key prompt on stdin.
+///
+/// If `YKMAN_MGMT_KEY` is set its value is piped to ykman; otherwise a blank
+/// line is piped so ykman uses its factory-default management key. The key is
+/// deliberately not passed as `--management-key` (argv is world-readable on
+/// most hosts). `extra_path` is appended after the arguments (used for output
+/// PEM paths).
 fn ykman_with_mgmt(args: &[&str], extra_path: Option<&PathBuf>) -> Result<std::process::Output> {
     use std::io::Write;
     let mut cmd = Command::new("ykman");
     cmd.args(args);
-    let mk = mgmt_key_override();
-    if let Some(ref k) = mk {
-        cmd.args(["--management-key", k]);
-    }
     if let Some(p) = extra_path {
         cmd.arg(p);
     }
-    if mk.is_none() {
-        cmd.stdin(std::process::Stdio::piped());
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-        let mut child = cmd.spawn().map_err(ykman_missing)?;
-        if let Some(stdin) = child.stdin.as_mut() {
-            let _ = stdin.write_all(b"\n");
-        }
-        child
-            .wait_with_output()
-            .map_err(|e| CredError::YubiKey(format!("ykman wait failed: {}", e)))
-    } else {
-        cmd.output().map_err(ykman_missing)
+    let mk = mgmt_key_override().map(zeroize::Zeroizing::new);
+    let line = mgmt_key_stdin_line(mk.as_ref().map(|k| k.as_str()));
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().map_err(ykman_missing)?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        let _ = stdin.write_all(line.as_bytes());
     }
+    child
+        .wait_with_output()
+        .map_err(|e| CredError::YubiKey(format!("ykman wait failed: {}", e)))
 }
 
 /// Generate a P-256 keypair on-device in `slot` with the given policies.
@@ -541,6 +548,19 @@ mod tests {
                 "hex chars must be uppercase"
             );
         }
+    }
+
+    /// The management key is answered on stdin; a blank line selects the default.
+    #[test]
+    fn mgmt_key_goes_to_stdin_not_argv() {
+        assert_eq!(mgmt_key_stdin_line(None).as_str(), "\n");
+        assert_eq!(mgmt_key_stdin_line(Some("0102")).as_str(), "0102\n");
+        // Guard against reintroducing the argv form in the ykman wrapper.
+        let source = include_str!("piv.rs");
+        let wrapper_start = source.find("fn ykman_with_mgmt").expect("wrapper present");
+        let wrapper_end =
+            source[wrapper_start..].find("\n}\n").expect("wrapper end") + wrapper_start;
+        assert!(!source[wrapper_start..wrapper_end].contains("--management-key"));
     }
 
     #[test]

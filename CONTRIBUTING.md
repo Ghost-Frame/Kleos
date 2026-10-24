@@ -295,4 +295,4 @@ Use `--dry-run` to preview per-table counts without writing. Use `--handoffs-sou
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under the Elastic License 2.0.
+By submitting a contribution, you license it under the PolyForm Noncommercial License 1.0.0 and grant the project owner a perpetual, worldwide, irrevocable, royalty-free right to use, modify, sublicense, and relicense your contribution under any terms, including commercial terms.

@@ -564,6 +564,13 @@ pub static MIGRATIONS: &[Migration] = &[
     // as legacy workstreams; new writers can distinguish repository and
     // standalone sessions without overloading cwd-derived project names.
     migration!(102, "handoff_identity", run_migration_handoff_identity, tx),
+    // v103: exact-phone approval devices and one-time request bindings.
+    migration!(
+        103,
+        "phylax_phone_approvals",
+        run_migration_phylax_phone_approvals,
+        tx
+    ),
 ];
 
 // --- Version constants ---
@@ -1300,6 +1307,37 @@ fn run_migration_cred_audit_attribution_columns(conn: &rusqlite::Connection) -> 
 /// of a single-use capability token used for out-of-band approval decisions.
 fn run_migration_phylax_decide_token_hash(conn: &rusqlite::Connection) -> Result<()> {
     add_column_if_not_exists(conn, "phylax_approvals", "decide_token_hash", "TEXT")?;
+    Ok(())
+}
+
+/// Migration 103: add exact-phone enrollment and per-request binding state.
+fn run_migration_phylax_phone_approvals(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS phylax_phone_devices (
+            id INTEGER PRIMARY KEY,
+            device_id TEXT NOT NULL UNIQUE,
+            user_id INTEGER NOT NULL,
+            label TEXT NOT NULL,
+            public_key_der BLOB NOT NULL,
+            attestation_sha256 TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            revoked_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_phylax_phone_devices_active
+            ON phylax_phone_devices(user_id, device_id) WHERE revoked_at IS NULL;",
+    )
+    .map_err(|e| EngError::DatabaseMessage(format!("migration 103 phone devices: {e}")))?;
+    add_column_if_not_exists(conn, "phylax_approvals", "phone_nonce", "BLOB")?;
+    add_column_if_not_exists(conn, "phylax_approvals", "phone_request_digest", "BLOB")?;
+    add_column_if_not_exists(conn, "phylax_approvals", "phone_device_id", "TEXT")?;
+    add_column_if_not_exists(
+        conn,
+        "phylax_approvals",
+        "phone_required",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_not_exists(conn, "phylax_approvals", "phone_consumed_at", "TEXT")?;
+    add_column_if_not_exists(conn, "phylax_approvals", "operation_digest", "BLOB")?;
     Ok(())
 }
 

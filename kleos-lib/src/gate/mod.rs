@@ -609,6 +609,24 @@ mod tests {
         assert!(check_dangerous_patterns("rm -rf /", &c).is_some());
         assert!(check_dangerous_patterns("reboot", &c).is_some());
         assert!(check_dangerous_patterns("git reset --hard", &c).is_some());
+        // Sample/demo seeding is caught only in SQL statement shape, not in prose.
+        assert!(check_dangerous_patterns(
+            "psql -c \"insert into users select * from sample_users\"",
+            &c
+        )
+        .is_some());
+        assert!(
+            check_dangerous_patterns("sqlite3 app.db 'create table demo_items (id int)'", &c)
+                .is_some()
+        );
+        assert!(check_dangerous_patterns(
+            "cat > runbook.md <<'EOF'\nCreated for Zan. Sample verification steps.\nEOF",
+            &c
+        )
+        .is_none());
+        assert!(
+            check_dangerous_patterns("mkdir -p demo && git create-branch sample", &c).is_none()
+        );
     }
 
     /// Read-only shell commands remain allowed by the default policy.

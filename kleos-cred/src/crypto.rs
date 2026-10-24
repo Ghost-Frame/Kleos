@@ -10,6 +10,7 @@ use rand::TryRngCore;
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::types::ProxyPolicy;
 use crate::{CredError, Result, SecretData};
 
 /// Nonce size for AES-256-GCM (96 bits = 12 bytes).
@@ -263,17 +264,78 @@ pub fn init_kdf_salt_file(path: &std::path::Path) -> Result<String> {
     Ok(hex_salt)
 }
 
-/// Encrypt secret data with AES-256-GCM.
+/// JSON key under which the per-secret [`ProxyPolicy`] sits next to the
+/// [`SecretData`] fields inside the encrypted blob.
+const PROXY_POLICY_KEY: &str = "proxy_policy";
+
+/// Serialize `data` and, when `policy` is not the default, splice it in under
+/// [`PROXY_POLICY_KEY`]. The plaintext stays in a `Zeroizing` buffer; no
+/// intermediate `serde_json::Value` copy of the secret is made. A default
+/// policy writes nothing, so rows stay byte-compatible with older binaries.
+fn seal_secret_json(data: &SecretData, policy: &ProxyPolicy) -> Result<Zeroizing<Vec<u8>>> {
+    let mut json =
+        Zeroizing::new(serde_json::to_vec(data).map_err(|e| CredError::Encryption(e.to_string()))?);
+    if policy.is_default() {
+        return Ok(json);
+    }
+    let policy_json =
+        serde_json::to_vec(policy).map_err(|e| CredError::Encryption(e.to_string()))?;
+    // SecretData is an internally tagged enum of struct variants, so the JSON
+    // is always one object ending in `}`.
+    if json.last() != Some(&b'}') {
+        return Err(CredError::Encryption(
+            "unexpected secret serialization shape".into(),
+        ));
+    }
+    json.pop();
+    json.extend_from_slice(b",\"");
+    json.extend_from_slice(PROXY_POLICY_KEY.as_bytes());
+    json.extend_from_slice(b"\":");
+    json.extend_from_slice(&policy_json);
+    json.push(b'}');
+    Ok(json)
+}
+
+/// Parse a sealed blob into the secret and its proxy policy. A blob without a
+/// `proxy_policy` key (every row written before the policy existed) yields
+/// the default policy.
+fn open_secret_json(plaintext: &[u8]) -> Result<(SecretData, ProxyPolicy)> {
+    /// Policy-only view of the blob; unknown keys (the secret fields) are
+    /// skipped without being copied.
+    #[derive(serde::Deserialize)]
+    struct PolicyOnly {
+        /// The persisted policy, absent on legacy rows.
+        #[serde(default)]
+        proxy_policy: ProxyPolicy,
+    }
+    let data: SecretData =
+        serde_json::from_slice(plaintext).map_err(|e| CredError::Decryption(e.to_string()))?;
+    let policy: PolicyOnly =
+        serde_json::from_slice(plaintext).map_err(|e| CredError::Decryption(e.to_string()))?;
+    Ok((data, policy.proxy_policy))
+}
+
+/// Encrypt secret data with AES-256-GCM (default proxy policy).
 ///
 /// Returns (encrypted_data, nonce).
 pub fn encrypt_secret(
     key: &[u8; KEY_SIZE],
     data: &SecretData,
 ) -> Result<(Vec<u8>, [u8; NONCE_SIZE])> {
-    // Serialized secret plaintext; wrap in Zeroizing so it is scrubbed from
+    encrypt_secret_with_policy(key, data, &ProxyPolicy::default())
+}
+
+/// Encrypt secret data together with its per-secret [`ProxyPolicy`].
+///
+/// Returns (encrypted_data, nonce).
+pub fn encrypt_secret_with_policy(
+    key: &[u8; KEY_SIZE],
+    data: &SecretData,
+    policy: &ProxyPolicy,
+) -> Result<(Vec<u8>, [u8; NONCE_SIZE])> {
+    // Serialized secret plaintext; wrapped in Zeroizing so it is scrubbed from
     // the heap on drop rather than left recoverable via core dump or swap.
-    let plaintext =
-        Zeroizing::new(serde_json::to_vec(data).map_err(|e| CredError::Encryption(e.to_string()))?);
+    let plaintext = seal_secret_json(data, policy)?;
 
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| CredError::Encryption(format!("invalid key: {}", e)))?;
@@ -290,6 +352,20 @@ pub fn encrypt_secret(
         .map_err(|e| CredError::Encryption(format!("encryption failed: {}", e)))?;
 
     Ok((ciphertext, nonce_bytes))
+}
+
+/// Serialize a secret and its policy into the plaintext blob format used by
+/// both the local DB and the Kleos v3 vault entries.
+pub fn seal_secret_plaintext(
+    data: &SecretData,
+    policy: &ProxyPolicy,
+) -> Result<Zeroizing<Vec<u8>>> {
+    seal_secret_json(data, policy)
+}
+
+/// Parse a decrypted blob (local or v3) into the secret and its policy.
+pub fn open_secret_plaintext(plaintext: &[u8]) -> Result<(SecretData, ProxyPolicy)> {
+    open_secret_json(plaintext)
 }
 
 /// Encrypt raw bytes with AES-256-GCM.
@@ -334,12 +410,21 @@ pub fn decrypt(key: &[u8; KEY_SIZE], data: &[u8]) -> Result<Vec<u8>> {
         .map_err(|e| CredError::Decryption(format!("decryption failed: {}", e)))
 }
 
-/// Decrypt secret data with AES-256-GCM.
+/// Decrypt secret data with AES-256-GCM, discarding any proxy policy.
 pub fn decrypt_secret(
     key: &[u8; KEY_SIZE],
     encrypted_data: &[u8],
     nonce: &[u8; NONCE_SIZE],
 ) -> Result<SecretData> {
+    decrypt_secret_with_policy(key, encrypted_data, nonce).map(|(data, _policy)| data)
+}
+
+/// Decrypt secret data and its per-secret [`ProxyPolicy`] with AES-256-GCM.
+pub fn decrypt_secret_with_policy(
+    key: &[u8; KEY_SIZE],
+    encrypted_data: &[u8],
+    nonce: &[u8; NONCE_SIZE],
+) -> Result<(SecretData, ProxyPolicy)> {
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| CredError::Decryption(format!("invalid key: {}", e)))?;
 
@@ -353,7 +438,7 @@ pub fn decrypt_secret(
             .map_err(|e| CredError::Decryption(format!("decryption failed: {}", e)))?,
     );
 
-    serde_json::from_slice(&plaintext[..]).map_err(|e| CredError::Decryption(e.to_string()))
+    open_secret_json(&plaintext[..])
 }
 
 /// Generate a random 256-bit key.
@@ -759,5 +844,62 @@ mod tests {
         let key1 = derive_key_from_passphrase("my-passphrase", &salt1).unwrap();
         let key2 = derive_key_from_passphrase("my-passphrase", &salt2).unwrap();
         assert_ne!(key1, key2);
+    }
+
+    // A secret sealed with a policy round-trips with the policy intact, for
+    // every variant shape (including the map-bearing Environment variant).
+    #[test]
+    fn policy_round_trips_through_encryption() {
+        use crate::types::Origin;
+        let key = [7u8; KEY_SIZE];
+        let policy = ProxyPolicy {
+            allowed_origins: vec![Origin {
+                scheme: "https".into(),
+                host: "api.example.com".into(),
+                port: 443,
+            }],
+            extra_auth_headers: vec!["x-token".into()],
+            drop_response_body: true,
+        };
+        let secrets = [
+            SecretData::ApiKey {
+                key: "k-1234".into(),
+                endpoint: None,
+                notes: None,
+            },
+            SecretData::Note {
+                content: "n".into(),
+            },
+            SecretData::Environment {
+                variables: std::collections::HashMap::from([("A".to_string(), "b".to_string())]),
+            },
+        ];
+        for data in &secrets {
+            let (ct, nonce) = encrypt_secret_with_policy(&key, data, &policy).unwrap();
+            let (back, back_policy) = decrypt_secret_with_policy(&key, &ct, &nonce).unwrap();
+            assert_eq!(back.type_name(), data.type_name());
+            assert_eq!(back.primary_value(), data.primary_value());
+            assert_eq!(back_policy, policy);
+            // The plain decrypt path still works and ignores the policy.
+            let plain = decrypt_secret(&key, &ct, &nonce).unwrap();
+            assert_eq!(plain.primary_value(), data.primary_value());
+        }
+    }
+
+    // A row written without a policy (the pre-policy format) loads with the
+    // default policy, and a default policy writes no `proxy_policy` key.
+    #[test]
+    fn legacy_rows_load_with_default_policy() {
+        let data = SecretData::ApiKey {
+            key: "legacy".into(),
+            endpoint: None,
+            notes: None,
+        };
+        let sealed = seal_secret_json(&data, &ProxyPolicy::default()).unwrap();
+        assert_eq!(&sealed[..], &serde_json::to_vec(&data).unwrap()[..]);
+        assert!(!String::from_utf8_lossy(&sealed).contains(PROXY_POLICY_KEY));
+        let (back, policy) = open_secret_json(&sealed).unwrap();
+        assert_eq!(back.primary_value(), "legacy");
+        assert!(policy.is_default());
     }
 }

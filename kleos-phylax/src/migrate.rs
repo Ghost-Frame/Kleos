@@ -71,6 +71,19 @@ pub fn ensure_tables(conn: &rusqlite::Connection) -> Result<(), CredError> {
         CREATE INDEX IF NOT EXISTS idx_phylax_piv_active
             ON phylax_piv_pubkeys(agent_name) WHERE revoked_at IS NULL;
 
+        CREATE TABLE IF NOT EXISTS phylax_phone_devices (
+            id INTEGER PRIMARY KEY,
+            device_id TEXT NOT NULL UNIQUE,
+            user_id INTEGER NOT NULL,
+            label TEXT NOT NULL,
+            public_key_der BLOB NOT NULL,
+            attestation_sha256 TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            revoked_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_phylax_phone_devices_active
+            ON phylax_phone_devices(user_id, device_id) WHERE revoked_at IS NULL;
+
         CREATE TABLE IF NOT EXISTS phylax_ssh_settings (
             id INTEGER PRIMARY KEY,
             user_id INTEGER NOT NULL,
@@ -101,6 +114,18 @@ pub fn ensure_tables(conn: &rusqlite::Connection) -> Result<(), CredError> {
         .map_err(|e| CredError::Database(e.to_string()))?;
     }
 
+    ensure_column(conn, "phylax_approvals", "phone_nonce", "BLOB")?;
+    ensure_column(conn, "phylax_approvals", "phone_request_digest", "BLOB")?;
+    ensure_column(conn, "phylax_approvals", "phone_device_id", "TEXT")?;
+    ensure_column(
+        conn,
+        "phylax_approvals",
+        "phone_required",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(conn, "phylax_approvals", "phone_consumed_at", "TEXT")?;
+    ensure_column(conn, "phylax_approvals", "operation_digest", "BLOB")?;
+
     // Additive: per-policy exec argv[0] allowlist (kleos-lib migration 86).
     let has_exec_allowlist: bool = conn
         .prepare(
@@ -121,6 +146,28 @@ pub fn ensure_tables(conn: &rusqlite::Connection) -> Result<(), CredError> {
     ensure_cred_audit_column(conn, "policy_id", "INTEGER")?;
     ensure_cred_audit_column(conn, "session_id", "TEXT")?;
 
+    Ok(())
+}
+
+/// Add a missing column to an existing Phylax table.
+fn ensure_column(
+    conn: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), CredError> {
+    let exists: i64 = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
+            params![column],
+            |row| row.get(0),
+        )
+        .map_err(|e| CredError::Database(e.to_string()))?;
+    if exists == 0 {
+        let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {definition}");
+        conn.execute(&sql, [])
+            .map_err(|e| CredError::Database(e.to_string()))?;
+    }
     Ok(())
 }
 

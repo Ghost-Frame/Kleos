@@ -37,6 +37,15 @@
           pkgs.darwin.apple_sdk.frameworks.SystemConfiguration
         ];
 
+        # nixpkgs has no PolyForm entry; describe the LICENSE file directly.
+        # Noncommercial terms are not free, so Nix requires allowUnfree to build.
+        polyformNoncommercial = {
+          spdxId = "PolyForm-Noncommercial-1.0.0";
+          fullName = "PolyForm Noncommercial License 1.0.0";
+          url = "https://polyformproject.org/licenses/noncommercial/1.0.0/";
+          free = false;
+        };
+
         # Common environment variables for building
         buildEnv = {
           PROTOC = "${pkgs.protobuf}/bin/protoc";
@@ -58,7 +67,7 @@
             doCheck = false; # tests require runtime services
             meta = {
               description = "Kleos memory server -- persistent semantic memory for AI agents";
-              license = pkgs.lib.licenses.elastic20;
+              license = polyformNoncommercial;
               mainProgram = "kleos-server";
             };
           };
@@ -74,7 +83,7 @@
             doCheck = false;
             meta = {
               description = "Kleos CLI -- command-line client for the Kleos memory server";
-              license = pkgs.lib.licenses.elastic20;
+              license = polyformNoncommercial;
               mainProgram = "kleos-cli";
             };
           };
@@ -90,7 +99,7 @@
             doCheck = false;
             meta = {
               description = "Kleos MCP server -- Model Context Protocol integration for LLM tools";
-              license = pkgs.lib.licenses.elastic20;
+              license = polyformNoncommercial;
               mainProgram = "kleos-mcp";
             };
           };

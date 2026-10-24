@@ -27,9 +27,10 @@ pub use crypto::{
     derive_key_legacy, encrypt, encrypt_recovery, encrypt_secret, generate_hmac_secret,
 };
 pub use storage::{
-    delete_secret, get_secret, list_secrets, store_secret, update_secret, SecretRow,
+    delete_secret, get_secret, get_secret_with_policy, list_secrets, store_secret,
+    store_secret_with_policy, update_secret, update_secret_with_policy, SecretRow,
 };
-pub use types::{SecretData, SecretType};
+pub use types::{Origin, ProxyPolicy, SecretData, SecretType};
 
 use thiserror::Error;
 

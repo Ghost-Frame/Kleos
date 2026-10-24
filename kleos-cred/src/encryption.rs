@@ -48,10 +48,32 @@ pub fn resolve_at_rest_key(
             key.copy_from_slice(&derived[..]);
             Ok(Some(key))
         }
+        // Custody: YubiKey slot 1 with the custody challenge file. The
+        // caller's precomputed response (slot 2) is deliberately ignored, and
+        // there is no fallback to slot 2: an unprogrammed slot 1 is an error.
+        EncryptionMode::Custody => {
+            tracing::info!("at-rest encryption mode: custody (yubikey slot 1)");
+            resolve_custody_key().map(Some)
+        }
         // Keyfile / Env: defer to the shared kleos_lib resolver (no YubiKey).
         _ => kleos_lib::encryption::resolve_key(config)
             .map_err(|e| anyhow::anyhow!("encryption key: {e}")),
     }
+}
+
+/// Derive the custody at-rest key: challenge from the custody challenge file,
+/// HMAC response from YubiKey slot 1 only.
+fn resolve_custody_key() -> anyhow::Result<[u8; 32]> {
+    let path = crate::yubikey::custody_challenge_path();
+    let challenge = crate::yubikey::get_or_create_challenge_at(&path)
+        .map_err(|e| anyhow::anyhow!("custody challenge: {e}"))?;
+    let response =
+        crate::yubikey::challenge_response_slot(&challenge, crate::yubikey::CUSTODY_SLOT)
+            .map_err(|e| anyhow::anyhow!("YubiKey slot 1 response: {e}"))?;
+    let derived = derive_key(0, b"", Some(&response));
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&derived[..]);
+    Ok(key)
 }
 
 // --- Persisted at-rest encryption mode -----------------------------------
@@ -86,6 +108,7 @@ fn mode_to_token(mode: &EncryptionMode) -> &'static str {
         EncryptionMode::Keyfile => "keyfile",
         EncryptionMode::Env => "env",
         EncryptionMode::Yubikey => "yubikey",
+        EncryptionMode::Custody => "custody",
     }
 }
 
@@ -98,6 +121,7 @@ fn mode_from_token(s: &str) -> Option<EncryptionMode> {
         "keyfile" => Some(EncryptionMode::Keyfile),
         "env" => Some(EncryptionMode::Env),
         "yubikey" => Some(EncryptionMode::Yubikey),
+        "custody" => Some(EncryptionMode::Custody),
         _ => None,
     }
 }
@@ -136,6 +160,7 @@ mod tests {
             EncryptionMode::Keyfile,
             EncryptionMode::Env,
             EncryptionMode::Yubikey,
+            EncryptionMode::Custody,
         ] {
             assert_eq!(mode_from_token(mode_to_token(&m)), Some(m));
         }

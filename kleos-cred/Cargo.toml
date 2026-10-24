@@ -4,7 +4,7 @@ version = "1.10.0"
 edition = "2021"
 rust-version.workspace = true
 description = "Credential management CLI with encrypted vault and YubiKey support"
-license = "Elastic-2.0"
+license = "PolyForm-Noncommercial-1.0.0"
 repository = "https://github.com/Ghost-Frame/Kleos"
 homepage = "https://kleos.syntheos.dev"
 
@@ -83,6 +83,12 @@ gui = ["eframe", "reqwest/blocking"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
+# tests/custody_cli.rs serves the real custody-profile router in-process and
+# drives the built `cred` binary against it. Dev-dependency cycles through
+# kleos-credd/kleos-phylax (which depend on this crate) are allowed by cargo.
+kleos-credd = { path = "../kleos-credd", version = "1.10.0" }
+kleos-phylax = { path = "../kleos-phylax", version = "1.10.0" }
+axum.workspace = true
 
 # Windows needs bundled SQLCipher since there's no system sqlite3.lib
 [target.'cfg(windows)'.dependencies]

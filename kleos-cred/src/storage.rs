@@ -2,8 +2,8 @@
 
 use kleos_lib::db::Database;
 
-use crate::crypto::{decrypt_secret, encrypt_secret, KEY_SIZE, NONCE_SIZE};
-use crate::types::{SecretData, SecretType};
+use crate::crypto::{decrypt_secret_with_policy, encrypt_secret_with_policy, KEY_SIZE, NONCE_SIZE};
+use crate::types::{ProxyPolicy, SecretData, SecretType};
 use crate::{CredError, Result};
 
 /// A stored secret row from the database.
@@ -18,8 +18,10 @@ pub struct SecretRow {
     pub updated_at: String,
 }
 
-/// Store a new secret in the database.
-#[tracing::instrument(skip(db, data, key), fields(user_id, category = %category, name = %name))]
+/// Store a new secret with the default (empty) proxy policy.
+///
+/// On a `(user, category, name)` conflict the row is replaced wholesale,
+/// including its proxy policy, which resets to the default.
 pub async fn store_secret(
     db: &Database,
     user_id: i64,
@@ -28,7 +30,32 @@ pub async fn store_secret(
     data: &SecretData,
     key: &[u8; KEY_SIZE],
 ) -> Result<i64> {
-    let (encrypted, nonce) = encrypt_secret(key, data)?;
+    store_secret_with_policy(
+        db,
+        user_id,
+        category,
+        name,
+        data,
+        &ProxyPolicy::default(),
+        key,
+    )
+    .await
+}
+
+/// Store a new secret together with its per-secret proxy policy.
+///
+/// The caller is responsible for running [`ProxyPolicy::validated`] first.
+#[tracing::instrument(skip(db, data, policy, key), fields(user_id, category = %category, name = %name))]
+pub async fn store_secret_with_policy(
+    db: &Database,
+    user_id: i64,
+    category: &str,
+    name: &str,
+    data: &SecretData,
+    policy: &ProxyPolicy,
+    key: &[u8; KEY_SIZE],
+) -> Result<i64> {
+    let (encrypted, nonce) = encrypt_secret_with_policy(key, data, policy)?;
     let secret_type = data.secret_type().as_str().to_string();
     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let name = name.to_string();
@@ -65,8 +92,7 @@ pub async fn store_secret(
     Ok(id)
 }
 
-/// Get a secret by category and name.
-#[tracing::instrument(skip(db, key), fields(user_id, category = %category, name = %name))]
+/// Get a secret by category and name, discarding its proxy policy.
 pub async fn get_secret(
     db: &Database,
     user_id: i64,
@@ -74,6 +100,20 @@ pub async fn get_secret(
     name: &str,
     key: &[u8; KEY_SIZE],
 ) -> Result<(SecretRow, SecretData)> {
+    let (row, data, _policy) = get_secret_with_policy(db, user_id, category, name, key).await?;
+    Ok((row, data))
+}
+
+/// Get a secret by category and name together with its proxy policy. Rows
+/// written before the policy existed load with the default policy.
+#[tracing::instrument(skip(db, key), fields(user_id, category = %category, name = %name))]
+pub async fn get_secret_with_policy(
+    db: &Database,
+    user_id: i64,
+    category: &str,
+    name: &str,
+    key: &[u8; KEY_SIZE],
+) -> Result<(SecretRow, SecretData, ProxyPolicy)> {
     let category = category.to_string();
     let name = name.to_string();
     let category_name = format!("{}/{}", category, name);
@@ -136,7 +176,7 @@ pub async fn get_secret(
     }
     nonce.copy_from_slice(&nonce_vec);
 
-    let data = decrypt_secret(key, &encrypted_data, &nonce)?;
+    let (data, policy) = decrypt_secret_with_policy(key, &encrypted_data, &nonce)?;
 
     let secret_row = SecretRow {
         id,
@@ -148,7 +188,7 @@ pub async fn get_secret(
         updated_at,
     };
 
-    Ok((secret_row, data))
+    Ok((secret_row, data, policy))
 }
 
 /// List secrets for a user, optionally filtered by category.
@@ -238,8 +278,7 @@ pub async fn list_secrets(
     Ok(secrets)
 }
 
-/// Update an existing secret.
-#[tracing::instrument(skip(db, data, key), fields(user_id, category = %category, name = %name))]
+/// Update an existing secret, keeping its stored proxy policy unchanged.
 pub async fn update_secret(
     db: &Database,
     user_id: i64,
@@ -248,7 +287,31 @@ pub async fn update_secret(
     data: &SecretData,
     key: &[u8; KEY_SIZE],
 ) -> Result<()> {
-    let (encrypted, nonce) = encrypt_secret(key, data)?;
+    update_secret_with_policy(db, user_id, category, name, data, None, key).await
+}
+
+/// Update an existing secret. `policy = Some(p)` replaces the stored proxy
+/// policy; `None` preserves whatever policy the row already has. Returns
+/// `NotFound` when the row does not exist.
+#[tracing::instrument(skip(db, data, policy, key), fields(user_id, category = %category, name = %name))]
+pub async fn update_secret_with_policy(
+    db: &Database,
+    user_id: i64,
+    category: &str,
+    name: &str,
+    data: &SecretData,
+    policy: Option<&ProxyPolicy>,
+    key: &[u8; KEY_SIZE],
+) -> Result<()> {
+    let effective = match policy {
+        Some(p) => p.clone(),
+        None => {
+            get_secret_with_policy(db, user_id, category, name, key)
+                .await?
+                .2
+        }
+    };
+    let (encrypted, nonce) = encrypt_secret_with_policy(key, data, &effective)?;
     let secret_type = data.secret_type().as_str().to_string();
     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let category = category.to_string();
@@ -501,5 +564,59 @@ mod tests {
 
         let result = get_secret(&db, 1, "svc", "secret", &key2).await;
         assert!(matches!(result, Err(CredError::Decryption(_))));
+    }
+
+    #[tokio::test]
+    async fn policy_persists_and_survives_plain_update() {
+        let db = setup_db().await;
+        let key = derive_key(1, b"password", None);
+        let policy = ProxyPolicy {
+            allowed_origins: vec![crate::types::Origin {
+                scheme: "https".into(),
+                host: "api.example.com".into(),
+                port: 443,
+            }],
+            extra_auth_headers: vec!["x-token".into()],
+            drop_response_body: true,
+        };
+        let data = |k: &str| SecretData::ApiKey {
+            key: k.into(),
+            endpoint: None,
+            notes: None,
+        };
+
+        store_secret_with_policy(&db, 1, "svc", "tok", &data("one"), &policy, &key)
+            .await
+            .expect("store");
+        let (_, _, got) = get_secret_with_policy(&db, 1, "svc", "tok", &key)
+            .await
+            .expect("get");
+        assert_eq!(got, policy);
+
+        // A value-only update keeps the policy; an explicit policy replaces it.
+        update_secret(&db, 1, "svc", "tok", &data("two"), &key)
+            .await
+            .expect("update");
+        let (_, d, got) = get_secret_with_policy(&db, 1, "svc", "tok", &key)
+            .await
+            .expect("get");
+        assert_eq!(d.primary_value(), "two");
+        assert_eq!(got, policy);
+
+        update_secret_with_policy(
+            &db,
+            1,
+            "svc",
+            "tok",
+            &data("three"),
+            Some(&ProxyPolicy::default()),
+            &key,
+        )
+        .await
+        .expect("update");
+        let (_, _, got) = get_secret_with_policy(&db, 1, "svc", "tok", &key)
+            .await
+            .expect("get");
+        assert!(got.is_default());
     }
 }

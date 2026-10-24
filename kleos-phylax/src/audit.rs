@@ -72,6 +72,10 @@ pub mod actions {
     pub const APPROVAL_GRANTED: &str = "approval_granted";
     /// Operator denied an agent's access request.
     pub const APPROVAL_DENIED: &str = "approval_denied";
+    /// An exact-phone signature was accepted for an approval decision.
+    pub const PHONE_APPROVAL_DECIDED: &str = "phone_approval_decided";
+    /// An exact-phone decision was rejected before it could change state.
+    pub const PHONE_APPROVAL_REJECTED: &str = "phone_approval_rejected";
     /// An approval request expired without a decision.
     pub const APPROVAL_EXPIRED: &str = "approval_expired";
     /// A single-use lease was minted from an approval.
