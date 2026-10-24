@@ -12,7 +12,11 @@ use serde_json::{json, Value};
 use tracing::warn;
 
 use kleos_cred::audit::{log_audit, AccessTier, AuditAction};
-use kleos_cred::storage::{delete_secret, list_secrets, store_secret, update_secret};
+use kleos_cred::storage::{
+    delete_secret, get_secret_with_policy, list_secrets, store_secret_with_policy,
+    update_secret_with_policy,
+};
+use kleos_cred::types::ProxyPolicy;
 use kleos_cred::CredError;
 
 use super::kleos_sync;
@@ -60,7 +64,7 @@ pub async fn list_handler(
                     &entry.hex_data,
                     state.master_key.as_ref(),
                 ) {
-                    Ok(data) => data.secret_type().to_string(),
+                    Ok((data, _policy)) => data.secret_type().to_string(),
                     Err(_) => "encrypted".to_string(),
                 };
                 items.push(SecretListItem {
@@ -92,12 +96,17 @@ pub async fn store_handler(
         return Err(CredError::PermissionDenied("only master key can store secrets".into()).into());
     }
 
-    let id = store_secret(
+    // Validate before anything is written: wildcard or empty origins and
+    // reserved auth headers are rejected here, not at proxy time.
+    let policy = body.proxy_policy.clone().unwrap_or_default().validated()?;
+
+    let id = store_secret_with_policy(
         &state.db,
         auth.user_id(),
         &category,
         &name,
         &body.data,
+        &policy,
         state.master_key.as_ref(),
     )
     .await?;
@@ -120,6 +129,7 @@ pub async fn store_handler(
         &category,
         &name,
         &body.data,
+        &policy,
         state.master_key.as_ref(),
     )
     .await;
@@ -214,12 +224,20 @@ pub async fn update_handler(
         );
     }
 
-    update_secret(
+    // An absent proxy_policy keeps the stored one; a present one is
+    // validated and replaces it.
+    let new_policy: Option<ProxyPolicy> = match body.proxy_policy.clone() {
+        Some(policy) => Some(policy.validated()?),
+        None => None,
+    };
+
+    update_secret_with_policy(
         &state.db,
         auth.user_id(),
         &category,
         &name,
         &body.data,
+        new_policy.as_ref(),
         state.master_key.as_ref(),
     )
     .await?;
@@ -236,13 +254,29 @@ pub async fn update_handler(
     )
     .await?;
 
-    // Sync to Kleos v3: delete old + store new (non-fatal)
+    // Sync to Kleos v3: delete old + store new (non-fatal). The effective
+    // policy is read back so a preserved policy is synced too.
+    let effective_policy = match new_policy {
+        Some(policy) => policy,
+        None => {
+            get_secret_with_policy(
+                &state.db,
+                auth.user_id(),
+                &category,
+                &name,
+                state.master_key.as_ref(),
+            )
+            .await?
+            .2
+        }
+    };
     kleos_sync::delete_from_kleos(&state, &category, &name).await;
     kleos_sync::store_to_kleos(
         &state,
         &category,
         &name,
         &body.data,
+        &effective_policy,
         state.master_key.as_ref(),
     )
     .await;
@@ -335,8 +369,11 @@ pub async fn sync_handler(
             }
         }
 
-        let data = match kleos_sync::decrypt_v3_entry(&entry.hex_data, state.master_key.as_ref()) {
-            Ok(d) => d,
+        let (data, policy) = match kleos_sync::decrypt_v3_entry(
+            &entry.hex_data,
+            state.master_key.as_ref(),
+        ) {
+            Ok(pair) => pair,
             Err(e) => {
                 warn!(category = %entry.category, name = %entry.name, error = %e, "failed to decrypt v3 entry during sync");
                 errors += 1;
@@ -344,12 +381,13 @@ pub async fn sync_handler(
             }
         };
 
-        match store_secret(
+        match store_secret_with_policy(
             &state.db,
             auth.user_id(),
             &entry.category,
             &entry.name,
             &data,
+            &policy,
             state.master_key.as_ref(),
         )
         .await

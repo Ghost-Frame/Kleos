@@ -16,6 +16,7 @@ use kleos_cred::CredError;
 
 use crate::auth::Auth;
 use crate::handlers::AppError;
+use crate::redact::{Redactor, MIN_SECRET_LEN};
 use crate::state::AppState;
 
 /// Response headers that must not be relayed from the upstream service back
@@ -242,21 +243,20 @@ fn proxy_domain_matches(pattern: &str, host: &str) -> bool {
     }
 }
 
-/// F09: decide whether the proxy may forward a secret to `host` for `category`.
+/// F09: decide whether the legacy-profile proxy may forward a secret to `host`
+/// for `category`.
 ///
 /// Pure (no env, no I/O) so the deny-by-default policy is unit-testable without
 /// standing up an `AppState`. Returns `Ok(())` to allow, `Err(reason)` to deny.
 ///
 /// - With an allowlist: permit only when a pattern under `category` (or the
 ///   wildcard `"*"` category) matches `host`. A category with no entry denies.
-/// - Without an allowlist: deny unless `allow_any` (set from
-///   `CREDD_PROXY_ALLOW_ANY=1` by the caller). This is the deny-by-default flip;
-///   the old behavior forwarded to any SSRF-passing host.
+/// - Without an allowlist: always deny. There is no environment opt-out; to
+///   forward anywhere an operator must write an explicit `"*"` entry.
 fn proxy_gate_decision(
     allowlist: Option<&crate::state::ProxyDomainAllowlist>,
     category: &str,
     host: &str,
-    allow_any: bool,
 ) -> std::result::Result<(), String> {
     match allowlist {
         Some(allowlist) => {
@@ -276,62 +276,118 @@ fn proxy_gate_decision(
                 ))
             }
         }
-        None if allow_any => Ok(()),
         None => Err(
-            "proxy denied: no proxy domain allowlist configured (set a per-category \
-                     allowlist, or CREDD_PROXY_ALLOW_ANY=1 to allow any host)"
+            "proxy denied: no proxy domain allowlist configured (set a per-category allowlist)"
                 .to_string(),
         ),
     }
 }
 
+/// The `(scheme, host, effective port)` triple a proxy target resolves to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TargetOrigin {
+    /// Lowercase scheme, `http` or `https`.
+    scheme: String,
+    /// Lowercase host as the `url` crate normalizes it (IPv6 stays bracketed).
+    host: String,
+    /// Explicit port, or the scheme default.
+    port: u16,
+}
+
+/// Extract the origin of a proxy target. Only `http`/`https` URLs with a host
+/// are proxyable.
+fn target_origin(url: &url::Url) -> std::result::Result<TargetOrigin, CredError> {
+    let scheme = url.scheme().to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return Err(CredError::InvalidInput(
+            "proxy target must use http or https".into(),
+        ));
+    }
+    let host = url
+        .host_str()
+        .map(str::to_ascii_lowercase)
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| CredError::InvalidInput("proxy target has no host".into()))?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| CredError::InvalidInput("proxy target has no usable port".into()))?;
+    Ok(TargetOrigin { scheme, host, port })
+}
+
+/// True when the URL's host is a loopback IP literal (used only by the test
+/// seam that lets integration tests reach a local upstream).
+fn is_loopback_literal(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        _ => false,
+    }
+}
+
+/// Copy upstream response headers for the caller, dropping upstream
+/// auth/session headers and any header whose name carries a secret, and
+/// redacting each remaining value on its own.
+fn collect_response_headers(
+    headers: &reqwest::header::HeaderMap,
+    redactor: &Redactor,
+) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    for (name, value) in headers.iter() {
+        if is_stripped_response_header(name.as_str()) {
+            continue;
+        }
+        if redactor.contains_secret(name.as_str().as_bytes()) {
+            continue;
+        }
+        if let Ok(text) = value.to_str() {
+            let redacted = redactor.redact_slice(text.as_bytes());
+            out.insert(
+                name.to_string(),
+                String::from_utf8_lossy(&redacted).into_owned(),
+            );
+        }
+    }
+    out
+}
+
 /// Proxy HTTP request with injected credentials.
 ///
-/// SECURITY: validates the target URL against SSRF deny lists (loopback,
-/// RFC1918 private, link-local, cloud metadata) before making the outbound
-/// request, which carries injected secret headers.
+/// The secret is injected into one request header, the upstream response is
+/// scanned for it in every known encoding (headers value by value, body
+/// streamed), and every match is replaced before anything is returned.
+///
+/// Gates, in order:
+/// - legacy profile: the per-category domain allowlist (deny by default);
+/// - category access for the caller;
+/// - custody profile: the target `(scheme, host, port)` must equal one of the
+///   secret's `allowed_origins` (403 before any DNS lookup or connection), and
+///   secrets under 3 bytes are refused;
+/// - the auth header must be `Authorization`, `X-Api-Key`, or one of the
+///   secret's `extra_auth_headers` (400 otherwise), under both profiles;
+/// - SSRF validation (loopback, private, link-local, cloud metadata) with the
+///   resolved address pinned for the connection.
 #[tracing::instrument(skip_all, fields(handler = "credd.resolve.proxy"))]
 pub async fn proxy_handler(
     Auth(auth): Auth,
     State(state): State<AppState>,
     Json(req): Json<ProxyRequest>,
 ) -> Result<Json<ProxyResponse>, AppError> {
-    // SECURITY (SSRF-DNS): SSRF validation -- reject requests targeting
-    // loopback, private, link-local, and cloud metadata addresses. Resolves
-    // DNS so domains pointing at private IPs are also caught. The proxy
-    // injects secret headers so an unvalidated URL would let an attacker
-    // exfiltrate credentials to internal services.
-    // Capture the address the hostname validated to. reqwest re-resolves DNS
-    // at request time, so without pinning an attacker could rebind the host to
-    // an internal IP between this check and the request (TOCTOU rebinding). We
-    // pin reqwest's resolver to this IP when building the client below, keeping
-    // the original hostname for TLS SNI and certificate validation. `None`
-    // means the URL already held a literal (already-validated) IP.
-    let pinned_ip = kleos_lib::webhooks::resolve_and_validate_url(&req.url)
-        .await
-        .map_err(|e| CredError::InvalidInput(format!("proxy target URL rejected: {}", e)))?;
+    let custody = state.run_profile.is_custody();
+    let parsed = url::Url::parse(&req.url)
+        .map_err(|e| CredError::InvalidInput(format!("invalid proxy URL: {}", e)))?;
+    let target = target_origin(&parsed)?;
 
-    // SECURITY (H4) + F09: per-category domain binding with deny-by-default.
-    // The decision is computed by the pure `proxy_gate_decision` helper so it is
-    // unit-testable without a live AppState. The CREDD_PROXY_ALLOW_ANY opt-out is
-    // read here (env access stays out of the pure helper).
-    let target_host = url::Url::parse(&req.url)
-        .ok()
-        .and_then(|u| u.host_str().map(|h| h.to_lowercase()));
-    let target_host = target_host.as_deref().unwrap_or("");
-    let allow_any = std::env::var("CREDD_PROXY_ALLOW_ANY").as_deref() == Ok("1");
-    if state.proxy_domain_allowlist.is_none() && allow_any {
-        tracing::warn!(
-            "CREDD_PROXY_ALLOW_ANY=1: proxy forwarding credentials without a domain allowlist"
-        );
-    }
-    if let Err(reason) = proxy_gate_decision(
-        state.proxy_domain_allowlist.as_deref(),
-        &req.secret_category,
-        target_host,
-        allow_any,
-    ) {
-        return Err(CredError::PermissionDenied(reason).into());
+    // SECURITY (H4) + F09: legacy per-category domain binding, deny by default.
+    // It needs only the URL, so it runs before the secret is touched. Custody
+    // replaces it with the per-secret origin check below.
+    if !custody {
+        if let Err(reason) = proxy_gate_decision(
+            state.proxy_domain_allowlist.as_deref(),
+            &req.secret_category,
+            &target.host,
+        ) {
+            return Err(CredError::PermissionDenied(reason).into());
+        }
     }
 
     if !auth.can_access_category(&req.secret_category) {
@@ -353,7 +409,7 @@ pub async fn proxy_handler(
         .into());
     }
 
-    let (_row, data) = super::get_secret_with_fallback(
+    let (_row, data, policy) = super::get_secret_and_policy_with_fallback(
         &state,
         auth.user_id(),
         &req.secret_category,
@@ -361,7 +417,34 @@ pub async fn proxy_handler(
     )
     .await?;
 
+    // SECURITY: custody origin pinning. The secret may only be sent to an
+    // origin its owner listed; checked before DNS resolution or any connection.
+    if custody && !policy.origin_allowed(&target.scheme, &target.host, target.port) {
+        log_audit(
+            &state.db,
+            auth.user_id(),
+            auth.agent_name(),
+            AuditAction::Proxy,
+            &req.secret_category,
+            &req.secret_name,
+            Some(AccessTier::Proxy),
+            false,
+        )
+        .await?;
+        return Err(CredError::PermissionDenied(format!(
+            "origin {}://{}:{} is not allowed for this secret",
+            target.scheme, target.host, target.port
+        ))
+        .into());
+    }
+
     let secret_value = data.primary_value();
+    if custody && secret_value.len() < MIN_SECRET_LEN {
+        return Err(CredError::InvalidInput(
+            "secret is too short to proxy safely (response redaction needs 3+ bytes)".into(),
+        )
+        .into());
+    }
 
     let method = req
         .method
@@ -370,14 +453,67 @@ pub async fn proxy_handler(
         .parse::<reqwest::Method>()
         .map_err(|e| CredError::InvalidInput(format!("invalid method: {}", e)))?;
 
+    // SECURITY: the secret may only be injected into an allowlisted header, so
+    // a caller cannot aim it at a header the upstream echoes or logs verbatim.
     let header_name = req
         .auth_header
         .clone()
         .unwrap_or_else(|| "Authorization".to_string());
+    if !policy.auth_header_allowed(&header_name) {
+        return Err(CredError::InvalidInput(format!(
+            "auth_header '{}' is not allowed for this secret",
+            header_name
+        ))
+        .into());
+    }
     let header_value = match req.auth_scheme.as_deref() {
-        Some("") => secret_value,
+        Some("") => secret_value.clone(),
         Some(scheme) => format!("{} {}", scheme.trim(), secret_value),
         None => format!("Bearer {}", secret_value),
+    };
+
+    // Everything the upstream could echo back: the injected header value, the
+    // bare secret, and the secret without surrounding whitespace.
+    // Values under 3 bytes cannot be redacted safely; custody already refused
+    // such a secret above, and the legacy profile still redacts the longer
+    // header value that wraps it.
+    let mut secrets: Vec<Vec<u8>> = Vec::new();
+    for candidate in [
+        header_value.as_str(),
+        secret_value.as_str(),
+        secret_value.trim(),
+    ] {
+        if candidate.len() >= MIN_SECRET_LEN && !secrets.iter().any(|s| s == candidate.as_bytes()) {
+            secrets.push(candidate.as_bytes().to_vec());
+        }
+    }
+    let redactor = Redactor::new(&secrets)
+        .map_err(|e| CredError::InvalidInput(format!("cannot build response redactor: {}", e)))?;
+    drop(secrets);
+
+    let injected_name = reqwest::header::HeaderName::from_bytes(header_name.as_bytes())
+        .map_err(|_| CredError::InvalidInput("auth_header is not a valid header name".into()))?;
+    let mut injected_value = reqwest::header::HeaderValue::from_str(&header_value)
+        .map_err(|_| CredError::InvalidInput("secret cannot be sent as a header value".into()))?;
+    injected_value.set_sensitive(true);
+
+    // SECURITY (SSRF-DNS): SSRF validation -- reject requests targeting
+    // loopback, private, link-local, and cloud metadata addresses. Resolves
+    // DNS so domains pointing at private IPs are also caught. The proxy
+    // injects secret headers so an unvalidated URL would let an attacker
+    // exfiltrate credentials to internal services.
+    // Capture the address the hostname validated to. reqwest re-resolves DNS
+    // at request time, so without pinning an attacker could rebind the host to
+    // an internal IP between this check and the request (TOCTOU rebinding). We
+    // pin reqwest's resolver to this IP when building the client below, keeping
+    // the original hostname for TLS SNI and certificate validation. `None`
+    // means the URL already held a literal (already-validated) IP.
+    let pinned_ip = if state.proxy_allow_loopback && is_loopback_literal(&parsed) {
+        None
+    } else {
+        kleos_lib::webhooks::resolve_and_validate_url(&req.url)
+            .await
+            .map_err(|e| CredError::InvalidInput(format!("proxy target URL rejected: {}", e)))?
     };
 
     // SECURITY (SEC-H2): disable redirect following to prevent Authorization
@@ -387,31 +523,34 @@ pub async fn proxy_handler(
     // SECURITY (SSRF-DNS): pin the validated IP so reqwest does not re-resolve
     // the hostname and cannot be steered to an internal address by a rebind.
     if let Some(ip) = pinned_ip {
-        let parsed = url::Url::parse(&req.url)
-            .map_err(|e| CredError::InvalidInput(format!("invalid proxy URL: {}", e)))?;
-        if let Some(host) = parsed.host_str() {
-            let port = parsed.port_or_known_default().unwrap_or(443);
-            client_builder = client_builder.resolve(host, std::net::SocketAddr::new(ip, port));
-        }
+        client_builder =
+            client_builder.resolve(&target.host, std::net::SocketAddr::new(ip, target.port));
     }
 
     let client = client_builder
         .build()
         .map_err(|e| CredError::InvalidInput(format!("client build failed: {}", e)))?;
-    let mut builder = client.request(method, &req.url);
+    let mut builder = client.request(method, parsed.as_str());
 
     // SECURITY: forward only safe caller headers. Hop-by-hop and framing
     // headers are dropped to prevent request smuggling/desync and Host override
-    // of the pinned connection.
+    // of the pinned connection. A caller header with the injected header's name
+    // is dropped so the upstream never sees two competing credentials, and the
+    // caller cannot choose the response encoding.
     if let Some(headers) = &req.headers {
         for (name, value) in headers {
-            if is_stripped_request_header(name) {
+            if is_stripped_request_header(name)
+                || name.eq_ignore_ascii_case(&header_name)
+                || name.eq_ignore_ascii_case("accept-encoding")
+            {
                 continue;
             }
             builder = builder.header(name, value);
         }
     }
-    builder = builder.header(&header_name, header_value);
+    // SECURITY: ask for an unencoded response so the redactor sees plaintext.
+    builder = builder.header(reqwest::header::ACCEPT_ENCODING, "identity");
+    builder = builder.header(injected_name, injected_value);
 
     if let Some(body) = &req.body {
         builder = builder.body(body.clone());
@@ -427,15 +566,24 @@ pub async fn proxy_handler(
         .map_err(|e| CredError::InvalidInput(format!("proxy request failed: {}", e)))?;
 
     let status = response.status().as_u16();
-    let mut headers = std::collections::HashMap::new();
-    for (name, value) in response.headers().iter() {
-        if is_stripped_response_header(name.as_str()) {
-            continue;
-        }
-        if let Ok(text) = value.to_str() {
-            headers.insert(name.to_string(), text.to_string());
+
+    // SECURITY: reqwest strips Content-Encoding after decoding gzip/brotli. Any
+    // encoding still present is one we cannot scan, so fail closed rather than
+    // relay bytes the redactor could not read.
+    if let Some(encoding) = response.headers().get(reqwest::header::CONTENT_ENCODING) {
+        let identity = encoding
+            .to_str()
+            .map(|v| v.trim().eq_ignore_ascii_case("identity"))
+            .unwrap_or(false);
+        if !identity {
+            return Err(CredError::InvalidInput(
+                "upstream used a content-encoding the proxy cannot inspect".into(),
+            )
+            .into());
         }
     }
+
+    let mut headers = collect_response_headers(response.headers(), &redactor);
 
     // Check Content-Length hint before reading body.
     if let Some(cl) = response.content_length() {
@@ -448,26 +596,41 @@ pub async fn proxy_handler(
         }
     }
 
-    // Stream the body and abort as soon as the cap is crossed: the
-    // Content-Length hint above only protects against honest servers, and a
-    // chunked response without one would otherwise buffer fully before the
-    // size check ran.
-    let body = {
+    let body = if policy.drop_response_body {
+        // The owner asked for status and headers only; the body is never read.
+        headers.remove("content-encoding");
+        headers.remove("transfer-encoding");
+        headers.insert("content-length".to_string(), "0".to_string());
+        String::new()
+    } else {
+        // Stream the body and abort as soon as the cap is crossed: the
+        // Content-Length hint above only protects against honest servers, and a
+        // chunked response without one would otherwise buffer fully before the
+        // size check ran. Each chunk passes through the redactor.
         use futures::StreamExt;
+        let mut redactor = redactor;
         let mut stream = response.bytes_stream();
+        let mut read = 0usize;
         let mut buf: Vec<u8> = Vec::new();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| {
                 CredError::InvalidInput(format!("proxy response read failed: {}", e))
             })?;
-            if buf.len() + chunk.len() > MAX_PROXY_RESPONSE {
+            read += chunk.len();
+            if read > MAX_PROXY_RESPONSE {
                 return Err(CredError::InvalidInput(format!(
                     "proxy response body too large: exceeds max {} bytes",
                     MAX_PROXY_RESPONSE
                 ))
                 .into());
             }
-            buf.extend_from_slice(&chunk);
+            buf.extend_from_slice(&redactor.feed(&chunk));
+        }
+        buf.extend_from_slice(&redactor.finish());
+        // The relayed body is the redacted one, so any upstream length no
+        // longer describes it.
+        if headers.contains_key("content-length") {
+            headers.insert("content-length".to_string(), buf.len().to_string());
         }
         String::from_utf8_lossy(&buf).into_owned()
     };
@@ -576,24 +739,19 @@ mod tests {
 
     use std::collections::HashMap;
 
-    /// F09: with no allowlist and no opt-out, the proxy denies by default.
+    /// F09: with no allowlist the proxy denies, and nothing in the environment
+    /// can change that.
     #[test]
-    fn proxy_gate_denies_without_allowlist_or_optout() {
-        let decision = proxy_gate_decision(None, "aws", "example.com", false);
-        assert!(decision.is_err(), "no allowlist + no opt-out must deny");
+    fn proxy_gate_denies_without_allowlist() {
+        let decision = proxy_gate_decision(None, "aws", "example.com");
+        assert!(decision.is_err(), "no allowlist must deny");
         assert!(decision
             .unwrap_err()
             .contains("no proxy domain allowlist configured"));
     }
 
-    /// F09: CREDD_PROXY_ALLOW_ANY (allow_any=true) restores forward-to-any-host.
-    #[test]
-    fn proxy_gate_allows_with_optout() {
-        assert!(proxy_gate_decision(None, "aws", "example.com", true).is_ok());
-    }
-
     /// An allowlist permits only matching hosts (exact, *. subdomain, * wildcard)
-    /// and denies everything else, regardless of the allow_any flag.
+    /// and denies everything else.
     #[test]
     fn proxy_gate_enforces_allowlist_patterns() {
         let mut allowlist: HashMap<String, Vec<String>> = HashMap::new();
@@ -602,31 +760,93 @@ mod tests {
         allowlist.insert("any".to_string(), vec!["*".to_string()]);
 
         // Subdomain wildcard: suffix itself and any subdomain match; siblings do not.
-        assert!(proxy_gate_decision(Some(&allowlist), "aws", "amazonaws.com", false).is_ok());
-        assert!(proxy_gate_decision(Some(&allowlist), "aws", "s3.amazonaws.com", false).is_ok());
-        assert!(proxy_gate_decision(Some(&allowlist), "aws", "evil.com", false).is_err());
+        assert!(proxy_gate_decision(Some(&allowlist), "aws", "amazonaws.com").is_ok());
+        assert!(proxy_gate_decision(Some(&allowlist), "aws", "s3.amazonaws.com").is_ok());
+        assert!(proxy_gate_decision(Some(&allowlist), "aws", "evil.com").is_err());
         // Prefix-spoofing must NOT satisfy the suffix wildcard (the ends_with
         // check requires a leading dot, so "evil-amazonaws.com" is rejected).
-        assert!(proxy_gate_decision(Some(&allowlist), "aws", "evil-amazonaws.com", false).is_err());
+        assert!(proxy_gate_decision(Some(&allowlist), "aws", "evil-amazonaws.com").is_err());
         // Patterns are lowercased at load (see state.rs); the helper compares a
         // lowercased host against lowercased patterns.
         assert!(proxy_gate_decision(
             Some(&allowlist),
             "aws",
-            "S3.AMAZONAWS.COM".to_lowercase().as_str(),
-            false
+            "S3.AMAZONAWS.COM".to_lowercase().as_str()
         )
         .is_ok());
 
         // Exact match only.
-        assert!(proxy_gate_decision(Some(&allowlist), "github", "api.github.com", false).is_ok());
-        assert!(proxy_gate_decision(Some(&allowlist), "github", "github.com", false).is_err());
+        assert!(proxy_gate_decision(Some(&allowlist), "github", "api.github.com").is_ok());
+        assert!(proxy_gate_decision(Some(&allowlist), "github", "github.com").is_err());
 
         // "*" pattern allows any host for that category.
-        assert!(proxy_gate_decision(Some(&allowlist), "any", "whatever.example", false).is_ok());
+        assert!(proxy_gate_decision(Some(&allowlist), "any", "whatever.example").is_ok());
 
-        // A category absent from the allowlist (and no "*" category entry) denies,
-        // even with allow_any set -- a configured allowlist is authoritative.
-        assert!(proxy_gate_decision(Some(&allowlist), "unknown", "api.github.com", true).is_err());
+        // A category absent from the allowlist (and no "*" category entry) denies.
+        assert!(proxy_gate_decision(Some(&allowlist), "unknown", "api.github.com").is_err());
+    }
+
+    /// The origin triple uses lowercase scheme/host and the scheme's default
+    /// port, and rejects non-http schemes.
+    #[test]
+    fn target_origin_normalizes_and_rejects_other_schemes() {
+        let origin = |raw: &str| target_origin(&url::Url::parse(raw).unwrap());
+        assert_eq!(
+            origin("HTTPS://API.Example.COM/v1?x=1").unwrap(),
+            TargetOrigin {
+                scheme: "https".into(),
+                host: "api.example.com".into(),
+                port: 443
+            }
+        );
+        assert_eq!(origin("http://example.com/").unwrap().port, 80);
+        assert_eq!(origin("https://example.com:8443/").unwrap().port, 8443);
+        // Userinfo cannot smuggle a different host into the comparison.
+        assert_eq!(
+            origin("https://api.example.com@evil.test/").unwrap().host,
+            "evil.test"
+        );
+        assert_eq!(origin("http://[::1]:9/").unwrap().host, "[::1]");
+        assert!(origin("ftp://example.com/").is_err());
+        assert!(origin("file:///etc/passwd").is_err());
+    }
+
+    /// Only loopback IP literals count for the test seam.
+    #[test]
+    fn loopback_literal_detection() {
+        let check = |raw: &str| is_loopback_literal(&url::Url::parse(raw).unwrap());
+        assert!(check("http://127.0.0.1:9/"));
+        assert!(check("http://[::1]:9/"));
+        assert!(!check("http://localhost:9/"));
+        assert!(!check("http://10.0.0.1/"));
+        assert!(!check("https://example.com/"));
+    }
+
+    /// Response headers: upstream auth/session headers are dropped, secrets in
+    /// a value are redacted per value, and a header named after the secret is
+    /// dropped.
+    #[test]
+    fn response_headers_are_redacted_per_value() {
+        use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+        let redactor = Redactor::new(&[b"sk-live-abcdef".to_vec()]).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-echo", HeaderValue::from_static("key=sk-live-abcdef;ok"));
+        headers.insert("x-plain", HeaderValue::from_static("fine"));
+        headers.insert(
+            "set-cookie",
+            HeaderValue::from_static("s=sk-live-abcdef; Path=/"),
+        );
+        headers.insert(
+            HeaderName::from_static("sk-live-abcdef"),
+            HeaderValue::from_static("name-leak"),
+        );
+        let out = collect_response_headers(&headers, &redactor);
+        assert_eq!(
+            out.get("x-echo").map(String::as_str),
+            Some("key=[REDACTED];ok")
+        );
+        assert_eq!(out.get("x-plain").map(String::as_str), Some("fine"));
+        assert!(!out.contains_key("set-cookie"));
+        assert!(!out.contains_key("sk-live-abcdef"));
     }
 }

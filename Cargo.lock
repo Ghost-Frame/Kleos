@@ -5062,9 +5062,11 @@ name = "kleos-credd"
 version = "1.10.0"
 dependencies = [
  "aes-gcm",
+ "aho-corasick",
  "anyhow",
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "futures",
@@ -5075,6 +5077,7 @@ dependencies = [
  "kleos-lib",
  "nix",
  "p256",
+ "proptest",
  "rand 0.9.4",
  "reqwest 0.12.28",
  "rpassword",

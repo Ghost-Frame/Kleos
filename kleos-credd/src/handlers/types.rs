@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use kleos_cred::types::SecretData;
+use kleos_cred::types::{ProxyPolicy, SecretData};
 
 #[derive(Deserialize)]
 pub struct ListQuery {
@@ -19,9 +19,16 @@ pub struct SecretListItem {
     pub updated_at: String,
 }
 
+/// Body of `POST`/`PUT /secret/{category}/{name}`.
 #[derive(Deserialize)]
 pub struct StoreRequest {
+    /// The secret itself.
     pub data: SecretData,
+    /// Optional per-secret proxy settings (allowed origins, extra auth
+    /// headers, response-body dropping). On store, absent means the default
+    /// (nothing allowed); on update, absent keeps the stored policy.
+    #[serde(default)]
+    pub proxy_policy: Option<ProxyPolicy>,
 }
 
 #[derive(Serialize)]
@@ -70,7 +77,14 @@ pub struct ResolveTextResponse {
     pub substitutions: usize,
 }
 
+/// Body of `POST /resolve/proxy`.
+///
+/// Unknown fields are rejected so the policy layer in front of the handler,
+/// which parses this same struct, can never see different fields than the
+/// handler acts on (a decoy `category`/`name` pair is a hard error, not a
+/// silently ignored key).
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProxyRequest {
     pub url: String,
     #[serde(default)]

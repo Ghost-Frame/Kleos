@@ -8,6 +8,7 @@ pub mod handlers;
 pub mod listener;
 pub mod peercred;
 pub mod profile;
+pub mod redact;
 pub mod routes;
 pub mod server;
 pub mod state;
@@ -127,8 +128,23 @@ where
     S: Clone + Send + Sync + 'static,
     AppState: FromRef<S>,
 {
+    credd_routes_with_inner_layer(state, |router| router)
+}
+
+/// Like [`credd_routes`], but applies `inner` to the bare route table before
+/// credd's own layers are added. Anything `inner` adds (for example a policy
+/// middleware) therefore runs after authentication: auth, rate limiting, body
+/// limit and timeout wrap it, and it can read the `AuthInfo` auth inserted.
+pub fn credd_routes_with_inner_layer<S>(
+    state: AppState,
+    inner: impl FnOnce(Router<S>) -> Router<S>,
+) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    AppState: FromRef<S>,
+{
     let table = credd_route_table::<S>(state.run_profile);
-    apply_credd_layers(table.into_router(), state)
+    apply_credd_layers(inner(table.into_router()), state)
 }
 
 /// List every `"METHOD path"` the credd router mounts under `profile`.
