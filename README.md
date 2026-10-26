@@ -459,4 +459,4 @@ PolyForm Noncommercial License 1.0.0
 
 ### Commercial licensing
 
-Kleos is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE). Personal, hobby, research, and other noncommercial use is permitted. Any commercial use, including selling, reselling, hosting, bundling, or otherwise earning revenue from this software, requires a separate written commercial license. Contact support@syntheos.dev.
+Kleos is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE). Personal, hobby, research, and other noncommercial use is permitted. Any commercial use, including selling, reselling, hosting, bundling, or otherwise earning revenue from this software, requires a separate written commercial license. Contact support@nulllogix.com
